@@ -22,10 +22,13 @@ using nlohmann::json;
 
 namespace {
 struct Fixture {
+  explicit Fixture(bool externalJobControl = false)
+      : server{manager, catalog, ServerOptions{"127.0.0.1", 0, "t", true, externalJobControl}} {}
+
   fs::path dir = fs::temp_directory_path() / ("bsolver-server-test-" + randomTokenHex(6));
   Catalog catalog = Catalog::builtin();
   JobManager manager{catalog, ManagerOptions{dir / "state", dir / "found.jsonl"}};
-  HttpServer server{manager, catalog, ServerOptions{"127.0.0.1", 0, "t", true}};
+  HttpServer server;
   int port = server.start();
   httplib::Client client{"127.0.0.1", port};
   httplib::Headers auth{{"Authorization", "Bearer t"}};
@@ -112,6 +115,32 @@ TEST_CASE("API rejects a second job and bad specs") {
   REQUIRE(stopAgain);
   CHECK(stopAgain->status == 409);
   CHECK(json::parse(stopAgain->body)["error"] == "no active job");
+}
+
+TEST_CASE("API refuses to start jobs and benchmarks when jobs are controlled externally") {
+  Fixture f(true);
+  auto r = f.client.Post("/api/job", f.auth, R"({"puzzle":20,"backend":"cpu"})", "application/json");
+  REQUIRE(r);
+  CHECK(r->status == 409);
+  CHECK(json::parse(r->body)["error"] == "pool mode controls jobs");
+  CHECK(f.manager.status().state == JobState::Idle);
+  auto b = f.client.Post("/api/bench", f.auth, R"({"algorithm":"scan","seconds":1})", "application/json");
+  REQUIRE(b);
+  CHECK(b->status == 409);
+  CHECK(json::parse(b->body)["error"] == "pool mode controls jobs");
+
+  // Job control of the externally started job still works.
+  JobSpec spec;
+  spec.puzzle = 60;
+  spec.algorithm = Algorithm::Scan;
+  spec.backend = "cpu";
+  spec.checkpoint = false;
+  f.manager.start(spec);
+  auto stop = f.client.Post("/api/job/stop", f.auth, "", "application/json");
+  REQUIRE(stop);
+  CHECK(stop->status == 200);
+  f.manager.wait();
+  CHECK(f.manager.status().outcome == Outcome::Stopped);
 }
 
 TEST_CASE("event stream sends status first and accepts the query token") {

@@ -22,6 +22,9 @@ struct ServerOptions {
   int port = 8080;  // 0 = any free port
   std::string token;
   bool serveUi = true;
+  // Jobs are driven by another component (pool mode): POST /api/job and /api/bench answer 409; stop/pause/resume
+  // still work.
+  bool externalJobControl = false;
 };
 
 // Pending SSE frames of one event-stream client (not thread-safe). Only the newest pending "status" frame is kept.

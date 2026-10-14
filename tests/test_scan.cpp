@@ -51,6 +51,26 @@ JobSpec cpuScan() {
   s.checkpoint = false;
   return s;
 }
+
+// Polls pred every 10 ms until it holds or the (generous) deadline passes.
+template <class Pred>
+bool pollUntil(Pred pred, std::chrono::seconds deadline) {
+  const auto end = std::chrono::steady_clock::now() + deadline;
+  while (!pred()) {
+    if (std::chrono::steady_clock::now() > end) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  return true;
+}
+
+Hash160 randomHash160() {
+  Rng rng;
+  Hash160 h;
+  for (auto& b : h) b = static_cast<uint8_t>(rng.next());
+  return h;
+}
+
+constexpr uint64_t kSmallLimit = uint64_t{1} << 20;  // scan_runner's small-key prefix bound
 }  // namespace
 
 TEST_CASE("sequential scan finds puzzle 24") {
@@ -67,18 +87,110 @@ TEST_CASE("sequential scan finds puzzle 24") {
   CHECK(lines[0].puzzle == 24);
 }
 
-TEST_CASE("random scan finds puzzle 20") {
+TEST_CASE("random scan finds puzzle 24") {
+  // [2^23, 2^24) lies above the small-key prefix, so only RandomSource segments can find dc2a04; each 2^20 segment
+  // covers it with probability ~1/7.
   TempDir dir;
   JobManager m(catalog(), ManagerOptions{dir.path / "state", dir.path / "found.jsonl"});
   JobSpec s = cpuScan();
-  s.puzzle = 20;
+  s.puzzle = 24;
   s.order = Order::Random;
-  auto t0 = std::chrono::steady_clock::now();
+  s.threads = 2;
   JobStatus st = runToEnd(m, s);
-  CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(30));
   REQUIRE(st.outcome == Outcome::Found);
-  CHECK(st.found[0].privkey.ends_with("d2c55"));
+  CHECK(st.found[0].privkey == std::string(58, '0') + "dc2a04");
+  CHECK(st.workDone >= static_cast<double>(kSmallLimit));  // at least one full random segment
   CHECK_FALSE(st.progress.has_value());
+  CHECK_FALSE(st.etaSeconds.has_value());
+}
+
+TEST_CASE("random scan checkpoint and resume") {
+  TempDir dir;
+  const U256 start = U256::fromU64(uint64_t{1} << 19);  // half the range below 2^20 goes through the prefix
+  const U256 end = U256::fromU64(uint64_t{1} << 40);
+  JobSpec s = cpuScan();
+  s.checkpoint = true;
+  s.order = Order::Random;
+  s.threads = 2;
+  s.addresses = {encodeP2PKH(randomHash160())};
+  s.rangeStart = start.toHex();
+  s.rangeEnd = end.toHex();
+  const ManagerOptions opts{dir.path / "state", dir.path / "found.jsonl"};
+  const ResolvedJob resolved = resolve(s, catalog());
+  const fs::path ckptPath = Checkpointer(opts.stateDir, Algo::Scan, resolved.identity, true, false).path();
+
+  // The prefix (2^19 keys) is done before any worker starts, so this much work includes random segments.
+  const double threshold = static_cast<double>((uint64_t{1} << 19) + 2 * kSmallLimit);
+  {
+    JobManager m(catalog(), opts);
+    m.start(s);
+    REQUIRE(pollUntil([&] { return m.status().workDone >= threshold; }, std::chrono::seconds(300)));
+    m.stop();
+    m.wait();
+    CHECK(m.status().outcome == Outcome::Stopped);
+  }
+  auto payload = Checkpointer::loadFile(ckptPath, Algo::Scan, resolved.identity);
+  REQUIRE(payload);
+  ByteReader r(*payload);
+  const uint64_t keysDone = r.u64();
+  const U256 prefixCursor = r.u256();
+  CHECK(r.remaining() == 0);
+  CHECK(static_cast<double>(keysDone) >= threshold);
+  CHECK_FALSE(prefixCursor < start);
+  CHECK(prefixCursor == U256::fromU64(kSmallLimit));  // the prefix finished before the random segments
+
+  {
+    JobManager m(catalog(), opts);
+    m.start(s);
+    REQUIRE(pollUntil([&] { return m.status().resumed; }, std::chrono::seconds(60)));
+    CHECK(m.status().workDone >= static_cast<double>(keysDone));
+    m.stop();
+    m.wait();
+    CHECK(m.status().outcome == Outcome::Stopped);
+  }
+  payload = Checkpointer::loadFile(ckptPath, Algo::Scan, resolved.identity);
+  REQUIRE(payload);
+  ByteReader r2(*payload);
+  CHECK(r2.u64() >= keysDone);
+  CHECK(r2.u256() == U256::fromU64(kSmallLimit));
+}
+
+TEST_CASE("random scan resumes a partial small-key prefix at its cursor") {
+  // A checkpoint taken mid-prefix: the resumed run must continue the prefix at prefixCursor, so it finds a key just
+  // below 2^20 after exactly one more 2^16-key prefix chunk.
+  TempDir dir;
+  const U256 key = U256::fromU64(kSmallLimit - 100);
+  JobSpec s = cpuScan();
+  s.checkpoint = true;
+  s.order = Order::Random;
+  s.threads = 2;
+  s.addresses = {encodeP2PKH(hash160Of(mulG(key), true))};
+  s.rangeStart = "1";
+  s.rangeEnd = U256::fromU64(uint64_t{1} << 40).toHex();
+  const ManagerOptions opts{dir.path / "state", dir.path / "found.jsonl"};
+  const ResolvedJob resolved = resolve(s, catalog());
+
+  const uint64_t prefixCursor = kSmallLimit - (uint64_t{1} << 16);
+  const uint64_t keysDone = prefixCursor - 1;  // [1, prefixCursor) scanned
+  {
+    Checkpointer c(opts.stateDir, Algo::Scan, resolved.identity, true, false);
+    c.setSnapshot([&] {
+      ByteWriter w;
+      w.u64(keysDone);
+      w.u256(U256::fromU64(prefixCursor));
+      return std::move(w.data());
+    });
+    c.saveNow();
+    c.clearSnapshot();
+  }
+
+  JobManager m(catalog(), opts);
+  JobStatus st = runToEnd(m, s);
+  REQUIRE(st.outcome == Outcome::Found);
+  CHECK(st.resumed);
+  CHECK(st.found[0].privkey == key.toHex(true));
+  // Resumed work plus the single chunk [prefixCursor, 2^20); a restart from rangeStart would add ~2^20.
+  CHECK(st.workDone == static_cast<double>(keysDone + (uint64_t{1} << 16)));
 }
 
 TEST_CASE("uncompressed address mode") {
@@ -201,15 +313,13 @@ TEST_CASE("scan exhausts a range without the key") {
 
 TEST_CASE("sequential scan checkpoint and resume") {
   TempDir dir;
-  Rng rng;
-  Hash160 h;
-  for (auto& b : h) b = static_cast<uint8_t>(rng.next());
   const U256 start = U256::fromU64(uint64_t{1} << 29);
-  const U256 end = start + (U256::fromU64(1) << 26);
+  // 2^34 keys: far more than any machine scans during the sleep below, so the job is stopped, not exhausted.
+  const U256 end = start + (U256::fromU64(1) << 34);
   JobSpec s;
   s.algorithm = Algorithm::Scan;
   s.backend = "cpu";
-  s.addresses = {encodeP2PKH(h)};
+  s.addresses = {encodeP2PKH(randomHash160())};
   s.rangeStart = start.toHex();
   s.rangeEnd = end.toHex();
   const ManagerOptions opts{dir.path / "state", dir.path / "found.jsonl"};
@@ -236,7 +346,7 @@ TEST_CASE("sequential scan checkpoint and resume") {
   {
     JobManager m(catalog(), opts);
     m.start(s);
-    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    REQUIRE(pollUntil([&] { return m.status().resumed; }, std::chrono::seconds(60)));
     JobStatus st = m.status();
     CHECK(st.resumed);
     CHECK(st.workDone >= static_cast<double>(keysDone));

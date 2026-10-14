@@ -47,6 +47,7 @@ std::string sseFrame(const std::string& type, const json& payload) {
 
 constexpr std::chrono::seconds kEventPollSlice{1};
 constexpr std::chrono::seconds kEventPingInterval{15};
+constexpr const char* kExternalJobControl = "pool mode controls jobs";
 
 const assets::Asset* findAsset(std::string_view path) {
   for (size_t i = 0; i < assets::kWebAssetsCount; ++i) {
@@ -185,6 +186,7 @@ void HttpServer::setupRoutes() {
   });
 
   s.Post("/api/job", [this](const httplib::Request& req, httplib::Response& res) {
+    if (options_.externalJobControl) return sendError(res, 409, kExternalJobControl);
     JobSpec spec;
     try {
       spec = json::parse(req.body).get<JobSpec>();
@@ -216,6 +218,7 @@ void HttpServer::setupRoutes() {
   s.Post("/api/job/resume", control(&JobManager::resume));
 
   s.Post("/api/bench", [this](const httplib::Request& req, httplib::Response& res) {
+    if (options_.externalJobControl) return sendError(res, 409, kExternalJobControl);
     Algo algo = Algo::Scan;
     double seconds = 2.0;
     try {

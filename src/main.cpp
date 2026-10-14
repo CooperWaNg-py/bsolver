@@ -238,11 +238,13 @@ std::string percentEncode(std::string_view s) {
   return out;
 }
 
+// externalJobControl: jobs are started by the caller (pool mode), so the API refuses to start jobs or benchmarks.
 std::unique_ptr<HttpServer> startWeb(JobManager& manager, const Catalog& catalog, const std::string& listen,
-                                     const std::string& tokenFlag) {
+                                     const std::string& tokenFlag, bool externalJobControl = false) {
   Listen l = parseListen(listen);
   std::string token = resolveToken(tokenFlag);
-  auto server = std::make_unique<HttpServer>(manager, catalog, ServerOptions{l.host, l.port, token, true});
+  auto server =
+      std::make_unique<HttpServer>(manager, catalog, ServerOptions{l.host, l.port, token, true, externalJobControl});
   int port = server->start();
   std::string host = l.host.find(':') != std::string::npos ? "[" + l.host + "]" : l.host;
   consoleOut("Web UI: http://" + host + ":" + std::to_string(port) + "/#token=" + percentEncode(token));
@@ -379,7 +381,7 @@ int cmdPool(const PoolCliOptions& o) {
   Catalog catalog = Catalog::builtin();
   JobManager manager(catalog, ManagerOptions{o.stateDir, o.results});
   std::unique_ptr<HttpServer> server;
-  if (o.web) server = startWeb(manager, catalog, *o.web, o.webToken);
+  if (o.web) server = startWeb(manager, catalog, *o.web, o.webToken, true);
   PoolSession session(manager, std::move(opts));
   installSignalHandlers(false);
 
@@ -482,7 +484,8 @@ int main(int argc, char** argv) {
   double benchSeconds = 2.0;
   unsigned benchThreads = 0;
   bench->add_option("--algo", benchAlgo, "Algorithm")->check(CLI::IsMember({"scan", "kangaroo"}));
-  bench->add_option("--seconds", benchSeconds, "Seconds per backend");
+  // Lower bound 0.1 s: shorter runs measure only noise (the API accepts (0, 60]).
+  bench->add_option("--seconds", benchSeconds, "Seconds per backend (0.1-60)")->check(CLI::Range(0.1, 60.0));
   bench->add_option("--threads", benchThreads, "CPU threads (0 = all)")->check(CLI::Range(0u, kMaxThreads));
 
   // pool

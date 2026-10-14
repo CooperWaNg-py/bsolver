@@ -414,21 +414,35 @@ bool PoolSession::submitAssignment() {
 void PoolSession::onFound(const FoundKey& key) {
   std::string hex;
   bool target = false;
+  bool pool = false;
   {
     std::lock_guard<std::mutex> lock(stateMu_);
-    if (!state_.assignment) return;
-    PoolAssignment& a = *state_.assignment;
-    const auto& proofs = a.range.proofAddresses;
-    if (std::find(proofs.begin(), proofs.end(), key.address) != proofs.end() && !a.proofKeys.count(key.address)) {
-      a.proofKeys[key.address] = upper(key.privkey);
-      state_.save(statePath_);
-      manager_.log(LogLevel::Info, "pool: proof key " + std::to_string(a.proofKeys.size()) + "/" +
-                                       std::to_string(proofs.size()) + " found");
+    if (state_.assignment) {
+      PoolAssignment& a = *state_.assignment;
+      const auto& proofs = a.range.proofAddresses;
+      const bool proof = std::find(proofs.begin(), proofs.end(), key.address) != proofs.end();
+      if (proof && !a.proofKeys.count(key.address)) {
+        a.proofKeys[key.address] = upper(key.privkey);
+        state_.save(statePath_);
+        manager_.log(LogLevel::Info, "pool: proof key " + std::to_string(a.proofKeys.size()) + "/" +
+                                         std::to_string(proofs.size()) + " found");
+      }
+      target = key.address == a.range.targetAddress;
+      pool = proof || target;
+      hex = a.range.hex;
     }
-    target = key.address == a.range.targetAddress;
-    hex = a.range.hex;
   }
-  if (target) recordTarget(key, hex);
+  if (target) {
+    recordTarget(key, hex);
+  } else if (!pool) {
+    // Not part of the current assignment (e.g. a job started outside the pool loop): record it like a normal job.
+    try {
+      appendResult(manager_.options().resultsPath, key);
+    } catch (const std::exception& ex) {
+      log(LogLevel::Error, ex.what());
+    }
+    consoleOut(foundLine(key));
+  }
 }
 
 void PoolSession::recordTarget(const FoundKey& key, const std::string& hex) {

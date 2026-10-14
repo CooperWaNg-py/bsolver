@@ -149,6 +149,7 @@ struct MockPool {
   int unfindableGets = 0;         // the next N ranges carry an extra proof address whose key lies outside the range
   int failPuts = 0;               // the next N submissions answer 503
   int pingsDuringFailedPuts = 0;  // pings seen when the last failing submission arrived
+  int failedPuts = 0;             // submissions answered 503 so far
   std::vector<httplib::Headers> puts;
   std::vector<std::string> webhookStatuses;
   httplib::Headers keyFound;
@@ -180,6 +181,7 @@ struct MockPool {
       std::lock_guard<std::mutex> lock(mu);
       if (failPuts > 0) {
         --failPuts;
+        ++failedPuts;
         pingsDuringFailedPuts = pings;
         res.status = 503;
         return;
@@ -461,6 +463,53 @@ TEST_CASE("pool session pings a scanned range while its submission is retried") 
   REQUIRE(mock.puts.size() == 1);
   CHECK(mock.puts[0].find("HashedProofKey")->second == mock.expectedProofHash());
   CHECK(mock.pingsDuringFailedPuts >= 1);
+}
+
+TEST_CASE("pool session records keys that do not belong to its assignment like a normal job") {
+  if (!httpsSupported()) SKIP("built without an HTTP client");
+  MockPool mock("FFFF", {7, 1000}, 4321);
+  mock.failPuts = 1000;  // hold the session in its submission retry loop until the foreign job has finished
+  TempDir dir;
+  PoolState s = savedState(parseRangeResponse(mock.rangeJson().dump()));
+  for (const auto& k : mock.proofKeys) s.assignment->proofKeys[MockPool::address(k)] = upperHex64(k);
+  s.assignment->scanComplete = true;
+  s.save(poolStatePath(dir.path / "state", 38));
+  const fs::path results = dir.path / "found.jsonl";
+  JobManager manager(catalog(), ManagerOptions{dir.path / "state", results});
+  PoolSession session(manager, mock.options());
+  std::atomic<int> rc{-1};
+  std::thread t([&] { rc = session.run(); });
+  auto failedPuts = [&] {
+    std::lock_guard<std::mutex> lock(mock.mu);
+    return mock.failedPuts;
+  };
+  // The first failed submission comes after the session installed its found handler.
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  while (failedPuts() == 0 && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  const bool submitting = failedPuts() > 0;
+  if (submitting) {
+    JobSpec spec;
+    spec.puzzle = 20;
+    spec.backend = "cpu";
+    spec.checkpoint = false;
+    manager.start(spec);
+    manager.wait();
+  }
+  {
+    std::lock_guard<std::mutex> lock(mock.mu);
+    mock.failPuts = 0;
+  }
+  t.join();
+  REQUIRE(submitting);
+  CHECK(rc == 0);
+  auto found = readResults(results);
+  REQUIRE(found.size() == 1);
+  CHECK(found[0].puzzle == 20);
+  CHECK(found[0].privkey.ends_with("d2c55"));
+  std::lock_guard<std::mutex> lock(mock.mu);
+  CHECK(mock.puts.size() == 1);
 }
 
 TEST_CASE("pool session resumes an interrupted range") {

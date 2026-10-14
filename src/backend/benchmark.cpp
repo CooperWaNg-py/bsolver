@@ -76,7 +76,7 @@ double scanThroughput(Backend& b, const BenchOptions& opt) {
       work += static_cast<double>(n);
       elapsed = std::chrono::duration<double>(Clock::now() - t0).count();
     }
-    rates[i] = work / elapsed;
+    rates[i] = elapsed > 0 ? work / elapsed : 0;  // no measured interval (seconds <= 0 or stopped): no rate
   });
   double total = 0;
   for (double r : rates) total += r;
@@ -158,7 +158,7 @@ double kangarooThroughput(Backend& b, const BenchOptions& opt) {
       jumps += static_cast<double>(w.step(dps));
       elapsed = std::chrono::duration<double>(Clock::now() - t0).count();
     }
-    rates[i] = jumps / elapsed;
+    rates[i] = elapsed > 0 ? jumps / elapsed : 0;
   });
   double total = 0;
   for (double r : rates) total += r;
