@@ -115,7 +115,7 @@ std::string PoolSession::chooseBackend(std::vector<std::string>* names) {
   std::string id = opts_.backend;
   if (id == "auto") {
     log(LogLevel::Info, "benchmarking backends for scan (once per session)");
-    auto results = manager_.bench(Algo::Scan, 2.0, opts_.threads);
+    auto results = manager_.bench(Algo::Scan, BenchOptions{2.0, opts_.threads, opts_.devices});
     const BenchResult* best = nullptr;
     for (const auto& r : results) {
       log(LogLevel::Info, "  " + r.backend + " [" + joined(r.devices, ", ") + "] " +
@@ -151,7 +151,14 @@ void PoolSession::setup() {
   }
   if (!cfg.publicKey.empty()) rsaKey_ = parseRsaPublicKeyPem(cfg.publicKey);
 
-  statePath_ = poolStatePath(manager_.options().stateDir, cfg.targetPuzzle);
+  const std::filesystem::path& stateDir = manager_.options().stateDir;
+  lock_ = FileLock::tryAcquire(poolLockPath(stateDir, cfg.targetPuzzle));
+  if (!lock_) {
+    throw std::runtime_error("state directory " + stateDir.string() +
+                             " is in use by another bsolver process for puzzle " + std::to_string(cfg.targetPuzzle) +
+                             "; use --state-dir");
+  }
+  statePath_ = poolStatePath(stateDir, cfg.targetPuzzle);
   std::optional<PoolState> loaded = PoolState::load(statePath_);
   const std::string tokenId = poolTokenId(cfg.userToken);
   if (loaded && loaded->tokenId != tokenId) {
@@ -257,6 +264,7 @@ int PoolSession::run() {
     const std::string stopMsg = state_.workerName + " went offline! (" + shortHash(api_->securityHash()) + ")";
     if (!api_->telegram(stopMsg)) api_->apiShare("workerExited", {});
   }
+  lock_.reset();
   return rc;
 }
 

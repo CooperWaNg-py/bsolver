@@ -31,10 +31,13 @@ struct PoolState {
 
   // std::nullopt when the file does not exist; throws std::runtime_error when it is unreadable.
   static std::optional<PoolState> load(const std::filesystem::path& path);
+  // Atomic: writes a uniquely named `<path>.<random>.tmp` and renames it over `path`.
   void save(const std::filesystem::path& path) const;
 };
 
 std::filesystem::path poolStatePath(const std::filesystem::path& stateDir, int puzzle);
+// Lock file a PoolSession holds for its whole run, so two processes never share one puzzle's pool state.
+std::filesystem::path poolLockPath(const std::filesystem::path& stateDir, int puzzle);
 std::string poolTokenId(const std::string& userToken);
 
 }  // namespace bsolver

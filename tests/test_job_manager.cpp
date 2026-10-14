@@ -2,6 +2,7 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <optional>
@@ -132,4 +133,86 @@ TEST_CASE("pause freezes work, resume continues it, stop while paused ends the j
   CHECK(st.workDone == *frozen2);
   CHECK(fs::exists(ckptPath));  // a stopped job keeps its checkpoint
   CHECK_THROWS_WITH(m.pause(), "no active job");
+}
+
+TEST_CASE("an auto-backend scan below the CPU prefix limit skips the benchmark") {
+  TempDir dir;
+  JobSpec s;
+  s.puzzle = 20;  // range ends at 0xfffff < 2^20: scanned entirely by the CPU prefix
+  s.algorithm = Algorithm::Scan;
+  s.backend = "auto";
+  s.checkpoint = false;
+  JobManager m(catalog(), ManagerOptions{dir.path / "state", dir.path / "found.jsonl"});
+  std::atomic<bool> sawBenchmarking{false};
+  const int sub = m.subscribe([&](const Event& e) {
+    if (e.type == "status" && e.payload.at("state") == "benchmarking") sawBenchmarking = true;
+  });
+  CHECK(m.start(s).state == JobState::Running);
+  m.wait();
+  m.unsubscribe(sub);
+  const JobStatus st = m.status();
+  CHECK_FALSE(sawBenchmarking);
+  CHECK(st.state == JobState::Finished);
+  CHECK(st.benchmark.empty());
+  CHECK(st.backend == "cpu");
+  REQUIRE(st.found.size() == 1);
+  CHECK(st.found[0].privkey.ends_with("d2c55"));
+}
+
+TEST_CASE("bench honours the device selection") {
+  TempDir dir;
+  JobManager m(catalog(), ManagerOptions{dir.path / "state", dir.path / "found.jsonl"});
+  const auto results = m.bench(Algo::Scan, BenchOptions{0.2, 1, {99}});
+  bool cpu = false;
+  for (const auto& r : results) {
+    INFO(r.backend);
+    if (r.backend == "cpu") {
+      cpu = true;
+      CHECK(r.verified);  // CPU threads are not devices
+    } else {
+      CHECK_FALSE(r.verified);
+      CHECK(r.error == "no matching devices");
+    }
+  }
+  CHECK(cpu);
+}
+
+TEST_CASE("two jobs cannot share a checkpoint") {
+  TempDir dir;
+  Rng rng;
+  Hash160 h;
+  for (auto& b : h) b = static_cast<uint8_t>(rng.next());
+  const U256 start = U256::fromU64(uint64_t{1} << 40);
+  JobSpec s;
+  s.algorithm = Algorithm::Scan;
+  s.backend = "cpu";
+  s.threads = 1;
+  s.addresses = {encodeP2PKH(h)};  // never found
+  s.rangeStart = start.toHex();
+  s.rangeEnd = (start + (U256::fromU64(1) << 40)).toHex();
+  const ManagerOptions opts{dir.path / "state", dir.path / "found.jsonl"};
+
+  JobManager first(catalog(), opts), second(catalog(), opts);
+  first.start(s);
+  CHECK_THROWS_AS(second.start(s), JobError);
+  CHECK_THROWS_WITH(second.start(s), Catch::Matchers::ContainsSubstring("is in use by another running bsolver job"));
+  CHECK(second.status().state == JobState::Idle);
+
+  // Without checkpointing nothing is shared.
+  JobSpec unchecked = s;
+  unchecked.checkpoint = false;
+  second.start(unchecked);
+  second.stop();
+  second.wait();
+
+  // The lock is released when the job ends, so the checkpoint can be taken over (and resumed). The first completed
+  // segment means the runner registered its snapshot, so stopping writes a checkpoint.
+  REQUIRE(pollUntil([&] { return first.status().workDone > 0; }, std::chrono::seconds(300)));
+  first.stop();
+  first.wait();
+  CHECK(second.start(s).state == JobState::Running);
+  CHECK(pollUntil([&] { return second.status().resumed; }, std::chrono::seconds(60)));
+  second.stop();
+  second.wait();
+  CHECK(second.status().outcome == Outcome::Stopped);
 }

@@ -155,7 +155,9 @@ TEST_CASE("kangaroo resumes from a checkpoint") {
   REQUIRE(interrupted);
   const double firstWork = m.status().workDone;
   CHECK(firstWork > 0);
-  REQUIRE_FALSE(fs::is_empty(dir.path / "state"));
+  const fs::path ckpt =
+      Checkpointer(dir.path / "state", Algo::Kangaroo, resolve(s, catalog()).identity, true, false).path();
+  REQUIRE(fs::exists(ckpt));
 
   {
     std::lock_guard<std::mutex> lock(mu);
@@ -170,7 +172,7 @@ TEST_CASE("kangaroo resumes from a checkpoint") {
   CHECK(st.workDone > firstWork);
   REQUIRE(st.outcome == Outcome::Found);
   CHECK(st.found[0].privkey == key64("ade6d7ce3b9b"));
-  CHECK(fs::is_empty(dir.path / "state"));
+  CHECK_FALSE(fs::exists(ckpt));  // a found job deletes its checkpoint (the empty .lock file stays)
 
   std::lock_guard<std::mutex> lock(mu);
   const std::regex restored(R"(resuming from checkpoint .*: (\d+) distinguished points, (\d+) jumps)");

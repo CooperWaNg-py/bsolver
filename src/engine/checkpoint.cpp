@@ -5,6 +5,7 @@
 #include <stdexcept>
 
 #include "core/hex.h"
+#include "core/random.h"
 #include "core/sha256.h"
 #include "engine/bytes.h"
 
@@ -31,6 +32,20 @@ Checkpointer::Checkpointer(const std::filesystem::path& stateDir, Algo algo, std
   uint8_t digest[32];
   sha256(reinterpret_cast<const uint8_t*>(identity_.data()), identity_.size(), digest);
   path_ = stateDir / (std::string(toString(algo)) + "-" + hexEncode(digest, 8) + ".ckpt");
+}
+
+bool Checkpointer::lock() {
+  std::lock_guard<std::mutex> guard(mu_);
+  if (!enabled_ || lock_) return true;
+  std::filesystem::path lockPath = path_;
+  lockPath += ".lock";
+  lock_ = FileLock::tryAcquire(lockPath);
+  return lock_.has_value();
+}
+
+void Checkpointer::unlock() {
+  std::lock_guard<std::mutex> guard(mu_);
+  lock_.reset();
 }
 
 std::optional<std::vector<uint8_t>> Checkpointer::loadFile(const std::filesystem::path& path, Algo algo,
@@ -113,7 +128,7 @@ void Checkpointer::write(const std::vector<uint8_t>& payload) {
 
   std::filesystem::create_directories(path_.parent_path());
   std::filesystem::path tmp = path_;
-  tmp += ".tmp";
+  tmp += "." + randomTokenHex(4) + ".tmp";  // unique: a concurrent writer never truncates this file
   {
     std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
     if (!out) throw std::runtime_error("cannot write checkpoint " + tmp.string());
@@ -127,7 +142,13 @@ void Checkpointer::write(const std::vector<uint8_t>& payload) {
       throw std::runtime_error("cannot write checkpoint " + tmp.string());
     }
   }
-  std::filesystem::rename(tmp, path_);
+  std::error_code ec;
+  std::filesystem::rename(tmp, path_, ec);
+  if (ec) {
+    std::error_code ignored;
+    std::filesystem::remove(tmp, ignored);
+    throw std::filesystem::filesystem_error("cannot replace checkpoint", tmp, path_, ec);
+  }
 }
 
 void Checkpointer::remove() {

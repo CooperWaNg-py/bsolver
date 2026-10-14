@@ -7,6 +7,7 @@
 #include <nlohmann/json.hpp>
 
 #include "core/hex.h"
+#include "core/random.h"
 #include "core/sha256.h"
 
 namespace bsolver {
@@ -26,6 +27,10 @@ json rangeToJson(const PoolRange& r) {
 
 std::filesystem::path poolStatePath(const std::filesystem::path& stateDir, int puzzle) {
   return stateDir / ("pool-" + std::to_string(puzzle) + ".json");
+}
+
+std::filesystem::path poolLockPath(const std::filesystem::path& stateDir, int puzzle) {
+  return stateDir / ("pool-" + std::to_string(puzzle) + ".lock");
 }
 
 std::string poolTokenId(const std::string& userToken) {
@@ -84,15 +89,25 @@ void PoolState::save(const std::filesystem::path& path) const {
          {"lastSubmittedAt", lastSubmittedAt}};
   if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path());
   std::filesystem::path tmp = path;
-  tmp += ".tmp";
+  tmp += "." + randomTokenHex(4) + ".tmp";  // unique: a concurrent writer never truncates this file
   {
     std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
     out << j.dump(2, ' ', false, json::error_handler_t::replace) << "\n";
     out.flush();
     out.close();
-    if (!out) throw std::runtime_error("cannot write pool state " + tmp.string());
+    if (!out) {
+      std::error_code ec;
+      std::filesystem::remove(tmp, ec);
+      throw std::runtime_error("cannot write pool state " + tmp.string());
+    }
   }
-  std::filesystem::rename(tmp, path);
+  std::error_code ec;
+  std::filesystem::rename(tmp, path, ec);
+  if (ec) {
+    std::error_code ignored;
+    std::filesystem::remove(tmp, ignored);
+    throw std::filesystem::filesystem_error("cannot replace pool state", tmp, path, ec);
+  }
 }
 
 }  // namespace bsolver

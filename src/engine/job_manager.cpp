@@ -42,6 +42,13 @@ Backend& validateBackend(const JobSpec& spec, Algo algo) {
   if (!b->supports(algo)) throw JobError("backend " + id + " does not support " + std::string(toString(algo)));
   return *b;
 }
+
+// backend=auto benchmarks every backend first, except for BSGS (CPU only) and scans that end below the CPU-only
+// small-key prefix (kScanSmallLimit), which never reach a backend worker.
+bool benchmarksBackends(const JobSpec& spec, const ResolvedJob& r) {
+  if (spec.backend != "auto" || r.algorithm == Algo::Bsgs) return false;
+  return !(r.algorithm == Algo::Scan && r.rangeEnd < kScanSmallLimit);
+}
 }  // namespace
 
 struct JobManager::ActiveJob {
@@ -103,6 +110,10 @@ JobStatus JobManager::start(const JobSpec& spec) {
   job->resolved = std::move(resolved);
   const ResolvedJob& r = job->resolved;
   job->ckpt = std::make_unique<Checkpointer>(options_.stateDir, r.algorithm, r.identity, spec.checkpoint, spec.fresh);
+  if (!job->ckpt->lock()) {
+    throw JobError("checkpoint " + job->ckpt->path().string() +
+                   " is in use by another running bsolver job; use another --state-dir or --no-checkpoint");
+  }
   job->ctx = std::make_unique<RunContext>(
       job->resolved, job->spec, *job->ckpt, [this](LogLevel l, const std::string& m) { log(l, m); },
       [this](const FoundKey& k) { onFound(k); });
@@ -115,7 +126,7 @@ JobStatus JobManager::start(const JobSpec& spec) {
     std::lock_guard<std::mutex> lock(mu_);
     JobStatus s;
     s.id = st_.id + 1;
-    bool benchmarking = spec.backend == "auto" && r.algorithm != Algo::Bsgs;
+    const bool benchmarking = benchmarksBackends(spec, r);
     s.state = benchmarking ? JobState::Benchmarking : JobState::Running;
     s.spec = spec;
     s.puzzle = r.puzzle;
@@ -141,9 +152,9 @@ void JobManager::runJob(std::shared_ptr<ActiveJob> job) {
   const Algo algo = job->resolved.algorithm;
   try {
     Backend* backend = nullptr;
-    if (algo == Algo::Bsgs) {
-      backend = findBackend("cpu");
-    } else if (job->spec.backend == "auto") {
+    if (!benchmarksBackends(job->spec, job->resolved)) {
+      backend = findBackend(algo == Algo::Bsgs || job->spec.backend == "auto" ? "cpu" : job->spec.backend);
+    } else {
       log(LogLevel::Info, "benchmarking backends for " + std::string(toString(algo)));
       auto results = runBenchmark(algo, BenchOptions{2.0, job->spec.threads, job->spec.devices});
       const BenchResult* best = nullptr;
@@ -168,8 +179,6 @@ void JobManager::runJob(std::shared_ptr<ActiveJob> job) {
       backend = findBackend(best->backend);
       log(LogLevel::Info, "selected backend " + best->backend + " (" +
                               formatRate(best->rate, algo == Algo::Kangaroo ? "jumps/s" : "keys/s") + ")");
-    } else {
-      backend = findBackend(job->spec.backend);
     }
 
     bool exhausted = false;
@@ -187,6 +196,7 @@ void JobManager::runJob(std::shared_ptr<ActiveJob> job) {
         case Algo::Kangaroo: runKangaroo(ctx, *backend); break;
       }
     }
+    job->ckpt->unlock();  // the runner has written its final checkpoint; another job may take it over now
     Outcome outcome = ctx.anyFound() ? Outcome::Found : exhausted ? Outcome::Exhausted : Outcome::Stopped;
     {
       std::lock_guard<std::mutex> lock(mu_);
@@ -197,6 +207,7 @@ void JobManager::runJob(std::shared_ptr<ActiveJob> job) {
     }
     log(LogLevel::Info, "job finished: " + std::string(toString(outcome)));
   } catch (const std::exception& ex) {
+    job->ckpt->unlock();
     {
       std::lock_guard<std::mutex> lock(mu_);
       st_.state = JobState::Failed;
@@ -329,7 +340,7 @@ void JobManager::throwIfBusyLocked() const {
   if (starting_ || (job_ && isActive(st_.state))) throw ConflictError("a job is already active");
 }
 
-std::vector<BenchResult> JobManager::bench(Algo algo, double seconds, unsigned threads) {
+std::vector<BenchResult> JobManager::bench(Algo algo, const BenchOptions& options) {
   {
     std::lock_guard<std::mutex> lock(mu_);
     throwIfBusyLocked();
@@ -342,7 +353,7 @@ std::vector<BenchResult> JobManager::bench(Algo algo, double seconds, unsigned t
       m->benchRunning_ = false;
     }
   } reset{this};
-  return runBenchmark(algo, BenchOptions{seconds, threads, {}});
+  return runBenchmark(algo, options);
 }
 
 int JobManager::subscribe(std::function<void(const Event&)> fn, bool initialStatus) {

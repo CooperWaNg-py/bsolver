@@ -10,13 +10,16 @@
 #include <vector>
 
 #include "engine/bytes.h"
+#include "engine/file_lock.h"
 #include "engine/types.h"
 
 namespace bsolver {
 
 // Checkpoint file `<stateDir>/<algo>-<first 16 hex of SHA256(identity)>.ckpt`:
 // "BSCK", u32 version=1, u32 identityLen, identity, u8 algo, algorithm payload.
-// Writes go to `<file>.tmp` and are renamed into place.
+// Writes go to a uniquely named `<file>.<random>.tmp` and are renamed into place. While a job runs, it holds an
+// exclusive lock on `<file>.lock` so two jobs (in any processes) never resume from and write the same checkpoint;
+// the empty lock file stays when the checkpoint is deleted (see FileLock).
 class Checkpointer {
  public:
   static constexpr std::chrono::seconds kInterval{60};
@@ -26,6 +29,11 @@ class Checkpointer {
 
   bool enabled() const { return enabled_; }
   const std::filesystem::path& path() const { return path_; }
+
+  // Takes the exclusive lock on `<file>.lock` (no-op when disabled). Returns false when another job holds it.
+  // Throws std::runtime_error when the lock file cannot be opened. Held until unlock() or destruction.
+  bool lock();
+  void unlock();
 
   // Algorithm payload of an existing checkpoint, or nullopt when disabled/fresh/missing.
   // Throws std::runtime_error("checkpoint <path> does not match this job") on identity mismatch.
@@ -58,6 +66,7 @@ class Checkpointer {
   std::mutex mu_;
   std::function<std::vector<uint8_t>()> snapshot_;
   std::chrono::steady_clock::time_point lastSave_;
+  std::optional<FileLock> lock_;  // guarded by mu_
 };
 
 // Registers a runner's snapshot function for the lifetime of the run. finish(complete) deletes the

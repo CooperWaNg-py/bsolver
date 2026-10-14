@@ -40,8 +40,8 @@ class JobManager {
   JobManager(const JobManager&) = delete;
   JobManager& operator=(const JobManager&) = delete;
 
-  // Throws JobError (invalid spec) or ConflictError("a job is already active" / "a benchmark is running")
-  // without waiting for a running benchmark.
+  // Throws JobError (invalid spec, or the job's checkpoint is locked by another job/process) or
+  // ConflictError("a job is already active" / "a benchmark is running") without waiting for a running benchmark.
   JobStatus start(const JobSpec& spec);
   // Throw ConflictError: "no active job" / "job is not running" / "job is not paused".
   JobStatus stop();
@@ -49,7 +49,7 @@ class JobManager {
   JobStatus resume();
   JobStatus status() const;
   // Blocking; throws ConflictError immediately while a job or another benchmark is active.
-  std::vector<BenchResult> bench(Algo algo, double seconds, unsigned threads = 0);
+  std::vector<BenchResult> bench(Algo algo, const BenchOptions& options);
 
   // Callbacks run on manager threads and must not call subscribe/unsubscribe. Exceptions they throw are swallowed.
   // Status events reach each subscriber in snapshot (seq) order. With initialStatus, fn first receives the current

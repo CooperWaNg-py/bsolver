@@ -3,6 +3,7 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -574,4 +575,84 @@ TEST_CASE("pool session stops on invalid tokens") {
   CHECK(PoolSession(manager, o).run() == 1);
   std::lock_guard<std::mutex> lock(mock.mu);
   CHECK(mock.gets == 1);
+}
+
+TEST_CASE("pool auto backend selection honours --devices") {
+  if (!httpsSupported()) SKIP("built without an HTTP client");
+  MockPool mock("FFFF", {7, 1000}, 4321);
+  TempDir dir;
+  JobManager manager(catalog(), ManagerOptions{dir.path / "state", dir.path / "found.jsonl"});
+  PoolSessionOptions o = mock.options();
+  o.backend = "auto";
+  o.devices = {99};  // matches no GPU device: only the CPU can be selected
+  REQUIRE(PoolSession(manager, o).run() == 0);
+  const JobStatus st = manager.status();
+  CHECK(st.backend == "cpu");
+  std::lock_guard<std::mutex> lock(mock.mu);
+  REQUIRE(mock.puts.size() == 1);
+  CHECK(mock.puts[0].find("GPUCount")->second == "1");
+}
+
+TEST_CASE("a second pool session on the same state directory fails fast") {
+  if (!httpsSupported()) SKIP("built without an HTTP client");
+  MockPool mock("FFFF", {7, 1000}, 4321);
+  mock.failPuts = 1000;  // hold the first session in its submission retry loop
+  TempDir dir;
+  const ManagerOptions mopts{dir.path / "state", dir.path / "found.jsonl"};
+  PoolState s = savedState(parseRangeResponse(mock.rangeJson().dump()));
+  for (const auto& k : mock.proofKeys) s.assignment->proofKeys[MockPool::address(k)] = upperHex64(k);
+  s.assignment->scanComplete = true;
+  s.save(poolStatePath(mopts.stateDir, 38));
+
+  JobManager manager(catalog(), mopts);
+  PoolSession session(manager, mock.options());
+  std::atomic<int> rc{-1};
+  std::thread t([&] { rc = session.run(); });
+  auto failedPuts = [&] {
+    std::lock_guard<std::mutex> lock(mock.mu);
+    return mock.failedPuts;
+  };
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  while (failedPuts() == 0 && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  const bool running = failedPuts() > 0;
+
+  JobManager other(catalog(), mopts);
+  std::mutex logMu;
+  std::vector<std::string> logs;
+  const int sub = other.subscribe([&](const Event& e) {
+    if (e.type != "log") return;
+    std::lock_guard<std::mutex> lock(logMu);
+    logs.push_back(e.payload.at("message").get<std::string>());
+  });
+  PoolSessionOptions o2 = mock.options();
+  o2.config.workerName = "intruder";
+  const auto t0 = std::chrono::steady_clock::now();
+  const int rc2 = running ? PoolSession(other, o2).run() : -1;
+  const auto elapsed = std::chrono::steady_clock::now() - t0;
+  other.unsubscribe(sub);
+
+  {
+    std::lock_guard<std::mutex> lock(mock.mu);
+    mock.failPuts = 0;
+  }
+  t.join();
+  REQUIRE(running);
+  CHECK(rc2 == 1);
+  CHECK(elapsed < std::chrono::seconds(10));
+  CHECK(rc == 0);
+  {
+    std::lock_guard<std::mutex> lock(logMu);
+    const std::string expected = "pool: state directory " + mopts.stateDir.string() +
+                                 " is in use by another bsolver process for puzzle 38; use --state-dir";
+    CHECK(std::find(logs.begin(), logs.end(), expected) != logs.end());
+  }
+  auto state = PoolState::load(poolStatePath(mopts.stateDir, 38));
+  REQUIRE(state);
+  CHECK(state->workerName == "testrig");  // the second session never touched the shared state
+  std::lock_guard<std::mutex> lock(mock.mu);
+  CHECK(mock.gets == 0);
+  REQUIRE(mock.puts.size() == 1);
+  CHECK(mock.puts[0].find("WorkerName")->second == "testrig");
 }

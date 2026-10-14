@@ -12,6 +12,7 @@
 #include <thread>
 #include <vector>
 
+#include "engine/file_lock.h"
 #include "engine/job_manager.h"
 #include "pool/pool_api.h"
 #include "pool/pool_config.h"
@@ -74,6 +75,7 @@ class PoolSession {
   JobManager& manager_;
   PoolSessionOptions opts_;
   std::filesystem::path statePath_;
+  std::optional<FileLock> lock_;  // pool-<puzzle>.lock in the state directory, held while run() executes
   std::optional<RsaPublicKey> rsaKey_;
   std::unique_ptr<PoolApi> api_;
   std::string backend_;

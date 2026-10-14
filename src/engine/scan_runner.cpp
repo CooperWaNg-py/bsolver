@@ -11,10 +11,9 @@
 namespace bsolver {
 
 namespace {
-const U256 kSmallLimit = U256::fromU64(uint64_t{1} << 20);
 // Keys >= n - 2^20 never go to GPU workers either: their kernels have no fallback for the dx == 0 cases within
 // GPU_GROUP keys of n. Those keys are scanned by a CPU worker inside the segment that contains them.
-const U256 kTopLimit = kOrderN - kSmallLimit;
+const U256 kTopLimit = kOrderN - kScanSmallLimit;
 
 void verifyCandidates(RunContext& ctx, const std::vector<U256>& candidates) {
   for (const U256& c : candidates) ctx.reportFound(c, mulG(c));
@@ -54,8 +53,8 @@ bool runScan(RunContext& ctx, Backend& backend) {
   // Keys below 2^20 never go to the workers (GPU kernels assume no small-key edge cases); keys >= kTopLimit go to a
   // CPU worker instead of a GPU one (see kTopLimit).
   bool prefixDone = true;
-  if (cursor < kSmallLimit && !(job.rangeEnd < cursor)) {
-    U256 prefixEnd = job.rangeEnd < kSmallLimit ? job.rangeEnd : kSmallLimit - 1;
+  if (cursor < kScanSmallLimit && !(job.rangeEnd < cursor)) {
+    U256 prefixEnd = job.rangeEnd < kScanSmallLimit ? job.rangeEnd : kScanSmallLimit - 1;
     auto cpu = makeCpuScanWorker(setup, 0);
     std::vector<U256> candidates;
     while (!(prefixEnd < cursor)) {
@@ -71,7 +70,8 @@ bool runScan(RunContext& ctx, Backend& backend) {
     prefixDone = prefixEnd < cursor;
   }
 
-  const U256 mainStart = sequential ? cursor : (job.rangeStart < kSmallLimit ? kSmallLimit : job.rangeStart);
+  const U256 mainStart =
+      sequential ? cursor : (job.rangeStart < kScanSmallLimit ? kScanSmallLimit : job.rangeStart);
   std::unique_ptr<SequentialSource> seq;
   std::unique_ptr<RandomSource> rnd;
   if (sequential) {

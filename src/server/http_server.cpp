@@ -240,7 +240,7 @@ void HttpServer::setupRoutes() {
     }
     if (!(seconds > 0 && seconds <= 60)) return sendError(res, 400, "seconds must be in (0, 60]");
     try {
-      sendJson(res, 200, json(manager_.bench(algo, seconds)));
+      sendJson(res, 200, json(manager_.bench(algo, BenchOptions{seconds, 0, {}})));
     } catch (const ConflictError& ex) {
       sendError(res, 409, ex.what());
     }
