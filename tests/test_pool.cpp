@@ -17,7 +17,9 @@
 #include "core/gtable.h"
 #include "core/random.h"
 #include "core/scalar.h"
+#include "engine/checkpoint.h"
 #include "engine/job_manager.h"
+#include "engine/job_spec.h"
 #include "pool/http_client.h"
 #include "pool/pool_api.h"
 #include "pool/pool_config.h"
@@ -380,7 +382,7 @@ PoolState savedState(const PoolRange& range) {
 }
 }  // namespace
 
-TEST_CASE("pool session drops a saved range the engine rejects") {
+TEST_CASE("pool session drops a saved range outside the key space") {
   if (!httpsSupported()) SKIP("built without an HTTP client");
   MockPool mock("FFFF", {7, 1000}, 4321);
   TempDir dir;
@@ -393,6 +395,53 @@ TEST_CASE("pool session drops a saved range the engine rejects") {
   CHECK(mock.gets == 1);
   REQUIRE(mock.puts.size() == 1);
   CHECK(mock.puts[0].find("HEX")->second == "200");
+}
+
+TEST_CASE("pool session keeps a saved range when a local setting is rejected") {
+  if (!httpsSupported()) SKIP("built without an HTTP client");
+  MockPool mock("FFFF", {7, 1000}, 4321);
+  TempDir dir;
+  const fs::path statePath = poolStatePath(dir.path / "state", 38);
+  savedState(parseRangeResponse(mock.rangeJson().dump())).save(statePath);
+  JobManager manager(catalog(), ManagerOptions{dir.path / "state", dir.path / "found.jsonl"});
+  PoolSessionOptions o = mock.options();
+  o.threads = kMaxThreads + 1;  // rejected by the engine: fatal, and not the saved range's fault
+  CHECK(PoolSession(manager, o).run() == 1);
+  auto state = PoolState::load(statePath);
+  REQUIRE(state);
+  REQUIRE(state->assignment);
+  CHECK(state->assignment->range.hex == "200");
+  std::lock_guard<std::mutex> lock(mock.mu);
+  CHECK(mock.gets == 0);
+}
+
+TEST_CASE("pool session rescans a saved range whose checkpoint is corrupt") {
+  if (!httpsSupported()) SKIP("built without an HTTP client");
+  MockPool mock("FFFF", {7, 1000}, 4321);
+  TempDir dir;
+  const fs::path stateDir = dir.path / "state";
+  const PoolRange range = parseRangeResponse(mock.rangeJson().dump());
+  savedState(range).save(poolStatePath(stateDir, 38));
+  // The checkpoint the session's scan job resumes from (same spec fields that determine the identity).
+  JobSpec spec;
+  spec.addresses = range.proofAddresses;
+  spec.addresses.push_back(range.targetAddress);
+  spec.rangeStart = range.start().toHex();
+  spec.rangeEnd = range.end().toHex();
+  spec.algorithm = Algorithm::Scan;
+  const fs::path ckpt = Checkpointer(stateDir, Algo::Scan, resolve(spec, catalog()).identity, true, false).path();
+  {
+    std::ofstream out(ckpt, std::ios::binary);
+    out << "BS";  // torn write
+  }
+  JobManager manager(catalog(), ManagerOptions{stateDir, dir.path / "found.jsonl"});
+  REQUIRE(PoolSession(manager, mock.options()).run() == 0);
+  CHECK_FALSE(manager.status().resumed);
+  CHECK_FALSE(fs::exists(ckpt));
+  std::lock_guard<std::mutex> lock(mock.mu);
+  CHECK(mock.gets == 0);
+  REQUIRE(mock.puts.size() == 1);
+  CHECK(mock.puts[0].find("HashedProofKey")->second == mock.expectedProofHash());
 }
 
 TEST_CASE("pool session pings a scanned range while its submission is retried") {

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState, type FormEvent } from 'react';
 import { api, errorMessage } from '../api';
 import type { AddressMode, Algorithm, Info, JobSpec, JobStatus, Order, Puzzle } from '../types';
+import { MAX_THREADS } from '../types';
 import { ErrorBox } from './common';
 
 export type Prefill = { puzzle: number; nonce: number };
@@ -126,7 +127,7 @@ export function NewJob({ info, puzzles, prefill, onStarted }: Props) {
     if (isScan && addressMode !== 'compressed') spec.addressMode = addressMode;
     if (backend !== 'auto') spec.backend = backend;
 
-    const t = parseOptInt('threads', threads, 0, 4096);
+    const t = parseOptInt('threads', threads, 0, MAX_THREADS);
     if (t !== undefined) spec.threads = t;
     const devs = devices.trim();
     if (devs) {
@@ -325,7 +326,14 @@ export function NewJob({ info, puzzles, prefill, onStarted }: Props) {
           <div className="grid2">
             <div className="field">
               <label htmlFor="threads">Threads (blank/0 = all cores)</label>
-              <input id="threads" type="number" min={0} value={threads} onChange={(e) => setThreads(e.target.value)} />
+              <input
+                id="threads"
+                type="number"
+                min={0}
+                max={MAX_THREADS}
+                value={threads}
+                onChange={(e) => setThreads(e.target.value)}
+              />
             </div>
             <div className="field">
               <label htmlFor="devices">Devices (comma list, blank = all)</label>

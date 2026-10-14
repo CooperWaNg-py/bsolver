@@ -2,6 +2,9 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <utility>
+
 #include "catalog/catalog.h"
 #include "engine/errors.h"
 #include "engine/job_spec.h"
@@ -68,19 +71,74 @@ TEST_CASE("resolve errors") {
 
 TEST_CASE("resolve rejects out-of-range resource limits") {
   CHECK_THROWS_WITH(resolve(spec(R"({"puzzle":140,"dpBits":61})"), catalog()), "dp bits must be 0-60");
-  CHECK_THROWS_WITH(resolve(spec(R"({"puzzle":140,"dpBits":-1})"), catalog()), "dp bits must be 0-60");
   CHECK(resolve(spec(R"({"puzzle":140,"dpBits":60})"), catalog()).algorithm == Algo::Kangaroo);
 
   CHECK_THROWS_WITH(resolve(spec(R"({"puzzle":20,"threads":1025})"), catalog()), "threads must be 0-1024");
-  CHECK_THROWS_WITH(resolve(spec(R"({"puzzle":20,"threads":-1})"), catalog()), "threads must be 0-1024");
   CHECK_NOTHROW(resolve(spec(R"({"puzzle":20,"threads":1024})"), catalog()));
 
   const std::string memError = "bsgsMemoryMb must be 1-" + std::to_string(maxBsgsMemoryMb());
   CHECK_THROWS_WITH(resolve(spec(R"({"puzzle":40,"algorithm":"bsgs","bsgsMemoryMb":0})"), catalog()), memError);
-  CHECK_THROWS_WITH(resolve(spec(R"({"puzzle":40,"algorithm":"bsgs","bsgsMemoryMb":-1})"), catalog()), memError);
   CHECK_NOTHROW(resolve(spec(R"({"puzzle":40,"algorithm":"bsgs","bsgsMemoryMb":64})"), catalog()));
   // Only BSGS allocates the table.
-  CHECK_NOTHROW(resolve(spec(R"({"puzzle":20,"algorithm":"scan","bsgsMemoryMb":-1})"), catalog()));
+  CHECK_NOTHROW(resolve(spec(R"({"puzzle":20,"algorithm":"scan","bsgsMemoryMb":0})"), catalog()));
+}
+
+TEST_CASE("integer job spec fields reject booleans, floats and out-of-range values") {
+  const std::pair<const char*, const char*> cases[] = {
+      {R"({"threads":true})", "threads"},
+      {R"({"threads":-1})", "threads"},
+      {R"({"threads":4294967296})", "threads"},
+      {R"({"puzzle":66.9})", "puzzle"},
+      {R"({"puzzle":false})", "puzzle"},
+      {R"({"puzzle":2147483648})", "puzzle"},
+      {R"({"bits":1e30})", "bits"},
+      {R"({"bits":-2147483649})", "bits"},
+      {R"({"bsgsMemoryMb":4294967297})", "bsgsMemoryMb"},
+      {R"({"bsgsMemoryMb":-1})", "bsgsMemoryMb"},
+      {R"({"bsgsMemoryMb":16.0})", "bsgsMemoryMb"},
+      {R"({"dpBits":-1})", "dpBits"},
+      {R"({"dpBits":true})", "dpBits"},
+      {R"({"devices":[0,1.5]})", "devices"},
+      {R"({"devices":[true]})", "devices"},
+      {R"({"devices":[2147483648]})", "devices"},
+      {R"({"devices":3})", "devices"},
+  };
+  for (const auto& [json, field] : cases) {
+    INFO(json);
+    CHECK_THROWS_WITH(spec(json), std::string("invalid value for '") + field + "'");
+  }
+  JobSpec s = spec(R"({"puzzle":-5,"bits":-1,"threads":4294967295,"bsgsMemoryMb":4294967295,"devices":[-1]})");
+  CHECK(s.puzzle == -5);
+  CHECK(s.bits == -1);
+  CHECK(s.threads == 4294967295u);
+  CHECK(s.bsgsMemoryMb == 4294967295u);
+  CHECK(s.devices == std::vector<int>{-1});
+}
+
+TEST_CASE("bsgs memory cap applies to the table the range needs") {
+  // Width 2^19 needs 2^18 baby steps (8 MiB), so the default 1024 MB budget fits a 512 MB cap.
+  CHECK(resolve(spec(R"({"puzzle":140,"bits":20})"), catalog(), 512).algorithm == Algo::Bsgs);
+  CHECK_NOTHROW(resolve(spec(R"({"puzzle":140,"bits":20,"bsgsMemoryMb":4294967295})"), catalog(), 8));
+  CHECK_THROWS_WITH(resolve(spec(R"({"puzzle":140,"bits":20})"), catalog(), 4), "bsgsMemoryMb must be 1-4");
+  // A wide range uses the whole budget: 1024 MB exceeds a 512 MB cap, 512 MB fits it.
+  CHECK_THROWS_WITH(resolve(spec(R"({"puzzle":40,"algorithm":"bsgs","bsgsMemoryMb":1024})"), catalog(), 512),
+                    "bsgsMemoryMb must be 1-512");
+  CHECK_NOTHROW(resolve(spec(R"({"puzzle":40,"algorithm":"bsgs","bsgsMemoryMb":512})"), catalog(), 512));
+  // A non-power-of-two budget rounds the table up.
+  CHECK_THROWS_WITH(resolve(spec(R"({"puzzle":40,"algorithm":"bsgs","bsgsMemoryMb":300})"), catalog(), 256),
+                    "bsgsMemoryMb must be 1-256");
+}
+
+TEST_CASE("bsgs sizing covers the range with at most W/2 baby steps") {
+  for (uint64_t w = 1; w <= 64; ++w) {
+    const uint64_t m = bsgsBabySteps(U256::fromU64(w), 1024);
+    CHECK(m == std::max<uint64_t>(1, w / 2));
+    CHECK(2 * m + 1 >= w);  // one giant step covers [0, 2m]
+  }
+  CHECK(bsgsBabySteps(U256::fromU64(1) << 100, 1) == 32768);
+  CHECK(bsgsTableSlots(1) == 2);
+  CHECK(bsgsTableSlots(3) == 8);
+  CHECK(bsgsTableSlots(32768) == 65536);
 }
 
 TEST_CASE("solved puzzle warns but resolves") {

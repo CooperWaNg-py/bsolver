@@ -54,6 +54,11 @@ if(BSOLVER_CUDA)
       set(CMAKE_CUDA_ARCHITECTURES native)
     endif()
     enable_language(CUDA)
+    # `native` fails at generation when the toolkit is installed but no NVIDIA GPU is visible (container/CI builds).
+    if(CMAKE_CUDA_ARCHITECTURES STREQUAL "native" AND NOT CMAKE_CUDA_ARCHITECTURES_NATIVE)
+      set(CMAKE_CUDA_ARCHITECTURES all-major)
+      message(STATUS "bsolver: no NVIDIA GPU detected for CUDA_ARCHITECTURES=native; building for all-major")
+    endif()
     find_package(CUDAToolkit REQUIRED)
     set(BSOLVER_HAS_CUDA ON)
     list(APPEND BSOLVER_BACKEND_SOURCES

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <set>
 #include <string>
+#include <utility>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -57,6 +58,25 @@ std::optional<T> optAs(const nlohmann::json& v, const char* field) {
   return getAs<T>(v, field);
 }
 
+// Integer fields: rejects booleans, floats and values outside T instead of letting nlohmann convert them.
+template <class T>
+T getInt(const nlohmann::json& v, const char* field) {
+  if (v.is_number_unsigned()) {
+    const auto u = v.get<uint64_t>();
+    if (std::in_range<T>(u)) return static_cast<T>(u);
+  } else if (v.is_number_integer()) {
+    const auto i = v.get<int64_t>();
+    if (std::in_range<T>(i)) return static_cast<T>(i);
+  }
+  throw JobError(std::string("invalid value for '") + field + "'");
+}
+
+template <class T>
+std::optional<T> optInt(const nlohmann::json& v, const char* field) {
+  if (v.is_null()) return std::nullopt;
+  return getInt<T>(v, field);
+}
+
 std::string enumString(const nlohmann::json& v, const char* field) {
   if (!v.is_string()) throw JobError(std::string("invalid value for '") + field + "'");
   return v.get<std::string>();
@@ -91,7 +111,7 @@ void from_json(const nlohmann::json& j, JobSpec& s) {
   s = JobSpec{};
   for (const auto& [k, v] : j.items()) {
     if (k == "puzzle") {
-      s.puzzle = optAs<int>(v, "puzzle");
+      s.puzzle = optInt<int>(v, "puzzle");
     } else if (k == "addresses") {
       if (!v.is_null()) s.addresses = getAs<std::vector<std::string>>(v, "addresses");
     } else if (k == "pubkey") {
@@ -101,7 +121,7 @@ void from_json(const nlohmann::json& j, JobSpec& s) {
     } else if (k == "rangeEnd") {
       s.rangeEnd = optAs<std::string>(v, "rangeEnd");
     } else if (k == "bits") {
-      s.bits = optAs<int>(v, "bits");
+      s.bits = optInt<int>(v, "bits");
     } else if (k == "algorithm") {
       std::string a = enumString(v, "algorithm");
       if (a == "auto") {
@@ -128,13 +148,17 @@ void from_json(const nlohmann::json& j, JobSpec& s) {
     } else if (k == "backend") {
       s.backend = enumString(v, "backend");
     } else if (k == "threads") {
-      s.threads = getAs<unsigned>(v, "threads");
+      s.threads = getInt<unsigned>(v, "threads");
     } else if (k == "devices") {
-      if (!v.is_null()) s.devices = getAs<std::vector<int>>(v, "devices");
+      if (!v.is_null()) {
+        if (!v.is_array()) throw JobError("invalid value for 'devices'");
+        s.devices.clear();
+        for (const auto& d : v) s.devices.push_back(getInt<int>(d, "devices"));
+      }
     } else if (k == "bsgsMemoryMb") {
-      s.bsgsMemoryMb = getAs<uint32_t>(v, "bsgsMemoryMb");
+      s.bsgsMemoryMb = getInt<uint32_t>(v, "bsgsMemoryMb");
     } else if (k == "dpBits") {
-      s.dpBits = optAs<uint32_t>(v, "dpBits");
+      s.dpBits = optInt<uint32_t>(v, "dpBits");
     } else if (k == "checkpoint") {
       s.checkpoint = getAs<bool>(v, "checkpoint");
     } else if (k == "fresh") {
@@ -147,7 +171,7 @@ void from_json(const nlohmann::json& j, JobSpec& s) {
   }
 }
 
-ResolvedJob resolve(const JobSpec& spec, const Catalog& catalog) {
+ResolvedJob resolve(const JobSpec& spec, const Catalog& catalog, uint32_t bsgsCapMb) {
   ResolvedJob r;
   r.addressMode = spec.addressMode;
   r.order = spec.order;
@@ -161,7 +185,6 @@ ResolvedJob resolve(const JobSpec& spec, const Catalog& catalog) {
 
   const Puzzle* puzzle = nullptr;
   std::set<Hash160> targets;
-  std::optional<std::string> pubkeyText;
   if (spec.puzzle) {
     puzzle = catalog.find(*spec.puzzle);
     if (!puzzle) throw JobError("unknown puzzle " + std::to_string(*spec.puzzle) + " (valid 1-160)");
@@ -186,7 +209,6 @@ ResolvedJob resolve(const JobSpec& spec, const Catalog& catalog) {
       } catch (const std::invalid_argument& ex) {
         throw JobError(ex.what());
       }
-      pubkeyText = *spec.pubkey;
     }
     if (targets.empty() && !r.pubkey) throw JobError("no target: give --puzzle, --address or --pubkey");
   }
@@ -237,16 +259,17 @@ ResolvedJob resolve(const JobSpec& spec, const Catalog& catalog) {
   }
   if (r.algorithm != Algo::Scan && spec.order == Order::Random) throw JobError("--order applies only to scan");
   if (r.algorithm == Algo::Bsgs) {
-    const uint32_t maxMb = maxBsgsMemoryMb();
-    if (spec.bsgsMemoryMb < 1 || spec.bsgsMemoryMb > maxMb) {
-      throw JobError("bsgsMemoryMb must be 1-" + std::to_string(maxMb));
+    // Only the table this range needs counts: a tiny range with the default budget fits any machine.
+    const uint64_t tableBytes = bsgsTableSlots(bsgsBabySteps(width, spec.bsgsMemoryMb)) * kBsgsSlotBytes;
+    if (spec.bsgsMemoryMb < 1 || tableBytes > (uint64_t{bsgsCapMb} << 20)) {
+      throw JobError("bsgsMemoryMb must be 1-" + std::to_string(bsgsCapMb));
     }
   }
 
   if (r.algorithm == Algo::Scan && targets.empty()) {
-    // Only a pubkey: hash it in its given encoding.
-    bool compressed = pubkeyText->size() == 66;
-    targets.insert(hash160Of(*r.pubkey, compressed));
+    // Only a pubkey: hash it in every encoding the address mode scans, whatever encoding it was given in.
+    if (hashesCompressed(r.addressMode)) targets.insert(hash160Of(*r.pubkey, true));
+    if (hashesUncompressed(r.addressMode)) targets.insert(hash160Of(*r.pubkey, false));
   }
   r.targets.assign(targets.begin(), targets.end());
 
@@ -263,6 +286,18 @@ ResolvedJob resolve(const JobSpec& spec, const Catalog& catalog) {
   }
   r.identity += "|" + std::string(toString(r.addressMode));
   return r;
+}
+
+uint64_t bsgsBabySteps(const U256& width, uint32_t memoryMb) {
+  const uint64_t memLimit = std::max<uint64_t>(1, (uint64_t{memoryMb} << 20) / 32);
+  const U256 half = width >> 1;
+  return half < U256::fromU64(memLimit) ? std::max<uint64_t>(1, half.w[0]) : memLimit;
+}
+
+uint64_t bsgsTableSlots(uint64_t m) {
+  uint64_t slots = 2;
+  while (slots < 2 * m) slots *= 2;
+  return slots;
 }
 
 uint32_t maxBsgsMemoryMb() {

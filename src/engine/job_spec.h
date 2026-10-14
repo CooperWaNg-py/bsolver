@@ -63,7 +63,15 @@ constexpr uint32_t kMaxDpBits = 60;
 constexpr uint32_t kFallbackMaxBsgsMemoryMb = 65536;
 uint32_t maxBsgsMemoryMb();
 
-// Validates the spec against the catalog. Throws JobError.
-ResolvedJob resolve(const JobSpec& spec, const Catalog& catalog);
+// BSGS sizing, shared by resolve() and the runner. One giant step covers 2m+1 keys, so m never needs to exceed
+// floor(W/2); otherwise it is bounded by the table budget of `memoryMb` MiB (32 bytes per baby step).
+uint64_t bsgsBabySteps(const U256& width, uint32_t memoryMb);
+// Slots of the baby-step table for m baby steps: the smallest power of two >= 2m (at least 2).
+uint64_t bsgsTableSlots(uint64_t m);
+constexpr uint64_t kBsgsSlotBytes = 16;
+
+// Validates the spec against the catalog. Throws JobError. `bsgsCapMb` bounds the BSGS table that the range and
+// bsgsMemoryMb actually need.
+ResolvedJob resolve(const JobSpec& spec, const Catalog& catalog, uint32_t bsgsCapMb = maxBsgsMemoryMb());
 
 }  // namespace bsolver

@@ -211,7 +211,7 @@ void JobManager::runJob(std::shared_ptr<ActiveJob> job) {
     job->done = true;
   }
   job->tickCv.notify_all();
-  publish(Event{"status", nlohmann::json(status())});
+  publishStatus();
   doneCv_.notify_all();
 }
 
@@ -243,7 +243,7 @@ void JobManager::tickLoop(std::shared_ptr<ActiveJob> job) {
     } catch (const std::exception& ex) {
       log(LogLevel::Error, std::string("checkpoint save failed: ") + ex.what());
     }
-    publish(Event{"status", nlohmann::json(status())});
+    publishStatus();
   }
 }
 
@@ -296,6 +296,7 @@ JobStatus JobManager::status() const {
 
 JobStatus JobManager::statusLocked() const {
   JobStatus s = st_;
+  s.seq = ++seq_;
   if (!job_) return s;
   const RunContext& ctx = *job_->ctx;
   auto end = job_->finished.value_or(std::chrono::steady_clock::now());
@@ -344,9 +345,11 @@ std::vector<BenchResult> JobManager::bench(Algo algo, double seconds, unsigned t
   return runBenchmark(algo, BenchOptions{seconds, threads, {}});
 }
 
-int JobManager::subscribe(std::function<void(const Event&)> fn) {
+int JobManager::subscribe(std::function<void(const Event&)> fn, bool initialStatus) {
   std::lock_guard<std::mutex> lock(subMu_);
   int id = nextSub_++;
+  // Under subMu_, so the initial snapshot is ordered before every status event published to this subscriber.
+  if (initialStatus) fn(Event{"status", nlohmann::json(status())});
   subs_[id] = std::move(fn);
   return id;
 }
@@ -358,6 +361,16 @@ void JobManager::unsubscribe(int id) {
 
 void JobManager::publish(const Event& e) {
   std::lock_guard<std::mutex> lock(subMu_);
+  deliverLocked(e);
+}
+
+void JobManager::publishStatus() {
+  // Taking the snapshot under subMu_ makes subscribers see status events in seq order.
+  std::lock_guard<std::mutex> lock(subMu_);
+  deliverLocked(Event{"status", nlohmann::json(status())});
+}
+
+void JobManager::deliverLocked(const Event& e) {
   for (auto& [id, fn] : subs_) {
     // A failing subscriber must not take down the manager thread (or the whole process) that published.
     try {

@@ -102,6 +102,43 @@ TEST_CASE("uncompressed address mode") {
   CHECK(std::equal(key, key + 32, wif->begin() + 1));
 }
 
+TEST_CASE("pubkey-only scan hashes the pubkey per address mode") {
+  const Affine pub = mulG(U256::fromU64(4321));
+  for (AddressMode mode : {AddressMode::Compressed, AddressMode::Uncompressed, AddressMode::Both}) {
+    for (bool compressedInput : {true, false}) {
+      TempDir dir;
+      JobManager m(catalog(), ManagerOptions{dir.path / "state", dir.path / "found.jsonl"});
+      JobSpec s = cpuScan();
+      s.pubkey = pubkeyHex(pub, compressedInput);
+      s.rangeStart = "1";
+      s.rangeEnd = "1388";  // 5000
+      s.addressMode = mode;
+      INFO("mode " << toString(mode) << ", compressed input " << compressedInput);
+      JobStatus st = runToEnd(m, s);
+      REQUIRE(st.outcome == Outcome::Found);
+      CHECK(st.found[0].privkey.ends_with("10e1"));  // 4321
+    }
+  }
+}
+
+TEST_CASE("both encodings of one key as targets stop the scan once found") {
+  TempDir dir;
+  JobManager m(catalog(), ManagerOptions{dir.path / "state", dir.path / "found.jsonl"});
+  const U256 key = U256::fromU64((uint64_t{1} << 21) + 12345);
+  const Affine pub = mulG(key);
+  JobSpec s = cpuScan();
+  s.addresses = {encodeP2PKH(hash160Of(pub, true)), encodeP2PKH(hash160Of(pub, false))};
+  s.rangeStart = U256::fromU64(uint64_t{1} << 21).toHex();
+  s.rangeEnd = U256::fromU64(uint64_t{1} << 28).toHex();
+  s.addressMode = AddressMode::Both;
+  JobStatus st = runToEnd(m, s);
+  REQUIRE(st.outcome == Outcome::Found);
+  REQUIRE(st.found.size() == 1);
+  CHECK(st.found[0].privkey == key.toHex(true));
+  // stopOnFound ended the job long before the end of the range.
+  CHECK(st.workDone < static_cast<double>(uint64_t{1} << 27));
+}
+
 TEST_CASE("corrupt checkpoint payload fails with a hint") {
   TempDir dir;
   JobSpec s = cpuScan();
@@ -133,6 +170,21 @@ TEST_CASE("runThreads stops the others and rethrows the first failure") {
                                }),
                     "boom");
   CHECK(ctx.stopRequested());
+  CHECK(finished == 3);
+}
+
+TEST_CASE("context-free runThreads calls onFailure and rethrows the first failure") {
+  std::atomic<bool> stop{false};
+  std::atomic<int> finished{0};
+  CHECK_THROWS_WITH(runThreads(
+                        4,
+                        [&](size_t i) {
+                          if (i == 1) throw std::runtime_error("bang");
+                          while (!stop) std::this_thread::yield();
+                          ++finished;
+                        },
+                        [&] { stop = true; }),
+                    "bang");
   CHECK(finished == 3);
 }
 

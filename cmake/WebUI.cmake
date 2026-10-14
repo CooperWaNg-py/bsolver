@@ -13,7 +13,8 @@ endif()
 
 set(WEBUI_DIR ${CMAKE_SOURCE_DIR}/webui)
 set(WEBUI_OUT ${CMAKE_BINARY_DIR}/webui-dist)
-set(WEBUI_CI_STAMP ${CMAKE_BINARY_DIR}/webui-npm-ci.stamp)
+# Written by `npm ci`; inside node_modules, so deleting node_modules reruns the install.
+set(WEBUI_CI_STAMP ${WEBUI_DIR}/node_modules/.package-lock.json)
 set(WEBUI_BUILD_STAMP ${CMAKE_BINARY_DIR}/webui-build.stamp)
 
 add_custom_command(

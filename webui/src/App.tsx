@@ -11,6 +11,7 @@ import { TokenPrompt } from './components/TokenPrompt';
 import { StateBadge } from './components/common';
 
 type Tab = 'dashboard' | 'new' | 'puzzles' | 'bench' | 'results';
+type LoadState = 'missing' | 'loading' | 'loaded';
 
 const TAB_LABELS: Record<Tab, string> = {
   dashboard: 'Dashboard',
@@ -45,6 +46,10 @@ export function App() {
   const [prefill, setPrefill] = useState<Prefill | null>(null);
   const [resultsKey, setResultsKey] = useState(0);
   const jobId = useRef<number | null>(null);
+  const lastSeq = useRef(0);
+  // A new event stream (possibly to a restarted server, whose seq restarts) delivers an authoritative snapshot first.
+  const resync = useRef(false);
+  const staticLoad = useRef({ info: 'missing' as LoadState, puzzles: 'missing' as LoadState });
 
   useEffect(() => {
     const onHash = () => setTab(tabFromHash());
@@ -55,26 +60,62 @@ export function App() {
 
   useEffect(() => onAuthNeeded(setAuthNeeded), []);
 
-  // Rate samples belong to one job; a new job id starts a fresh sparkline.
-  const applyStatus = useCallback((s: JobStatus) => {
+  // Snapshots can arrive out of order (an HTTP reply racing the event stream); drop ones older than the shown one.
+  // Rate samples belong to one job; a new job id starts a fresh sparkline. Returns whether `s` was applied.
+  const applyStatus = useCallback((s: JobStatus, force = false): boolean => {
+    if (!force && jobId.current === s.id && s.seq < lastSeq.current) return false;
     if (jobId.current !== s.id) {
       jobId.current = s.id;
       setRates([]);
     }
+    lastSeq.current = s.seq;
     setStatus(s);
+    return true;
+  }, []);
+
+  // /api/info and /api/puzzles are static per server: fetched on mount and again on every (re)connect while missing,
+  // so a tab opened while the server was down recovers without a reload.
+  const loadStatic = useCallback(() => {
+    const st = staticLoad.current;
+    if (st.info === 'missing') {
+      st.info = 'loading';
+      api.info().then(
+        (i) => {
+          st.info = 'loaded';
+          setInfo(i);
+        },
+        () => {
+          st.info = 'missing';
+        },
+      );
+    }
+    if (st.puzzles === 'missing') {
+      st.puzzles = 'loading';
+      api.puzzles().then(
+        (p) => {
+          st.puzzles = 'loaded';
+          setPuzzles(p);
+          setPuzzlesError(null);
+        },
+        (e) => {
+          st.puzzles = 'missing';
+          setPuzzlesError(errorMessage(e));
+        },
+      );
+    }
   }, []);
 
   useEffect(() => {
     api.job().then(applyStatus, (e) =>
       setLogs((l) => [...l, { time: new Date().toISOString(), level: 'error', message: `GET /api/job: ${errorMessage(e)}` }]),
     );
-    api.info().then(setInfo, () => undefined);
-    api.puzzles().then(setPuzzles, (e) => setPuzzlesError(errorMessage(e)));
+    loadStatic();
 
     return connectEvents({
       status: (s) => {
-        applyStatus(s);
-        if (ACTIVE_STATES.includes(s.state)) {
+        const applied = applyStatus(s, resync.current);
+        resync.current = false;
+        if (applied && ACTIVE_STATES.includes(s.state)) {
           setRates((r) => [...r.slice(-(MAX_RATE_SAMPLES - 1)), s.rate]);
         }
       },
@@ -85,9 +126,14 @@ export function App() {
         );
       },
       log: (l) => setLogs((prev) => [...prev.slice(-(MAX_LOG_LINES - 1)), l]),
-      connection: setConnected,
+      connection: (c) => {
+        setConnected(c);
+        if (!c) return;
+        resync.current = true;
+        loadStatic();
+      },
     });
-  }, [applyStatus]);
+  }, [applyStatus, loadStatic]);
 
   const onStarted = (s: JobStatus) => {
     applyStatus(s);

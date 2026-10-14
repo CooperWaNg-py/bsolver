@@ -61,6 +61,15 @@ U256 PoolRange::start() const { return U256::fromHex(hex + workloadStart); }
 
 U256 PoolRange::end() const { return start() + U256::fromHex(workloadEnd); }
 
+std::string rangeBoundsError(const PoolRange& r) {
+  const U256 start = r.start();
+  U256 end;
+  const bool overflow = add(end, start, U256::fromHex(r.workloadEnd)) != 0;
+  if (start.isZero()) return "range starts at key 0";
+  if (overflow || end >= kOrderN) return "range end is beyond the secp256k1 order";
+  return {};
+}
+
 PoolRange parseRangeResponse(const std::string& body, bool checkBounds) {
   PoolRange r;
   try {
@@ -84,13 +93,8 @@ PoolRange parseRangeResponse(const std::string& body, bool checkBounds) {
     throw PoolError(std::string("invalid range response: ") + ex.what(), false);
   }
   if (checkBounds) {
-    const U256 start = r.start();
-    U256 end;
-    const bool overflow = add(end, start, U256::fromHex(r.workloadEnd)) != 0;
-    if (start.isZero()) throw PoolError("invalid range response: range starts at key 0", false);
-    if (overflow || end >= kOrderN) {
-      throw PoolError("invalid range response: range end is beyond the secp256k1 order", false);
-    }
+    const std::string bad = rangeBoundsError(r);
+    if (!bad.empty()) throw PoolError("invalid range response: " + bad, false);
   }
   return r;
 }

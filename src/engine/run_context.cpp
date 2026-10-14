@@ -73,23 +73,24 @@ std::vector<FoundKey> RunContext::found() const {
 
 bool RunContext::reportFound(const U256& key, const Affine& pub) {
   Affine actual = mulG(key);
-  std::optional<Hash160> hit;
+  // Every target this key matches; hits[0] (compressed first) is the one reported.
+  std::vector<Hash160> hits;
   bool compressedHit = true;
   if (!pub.inf && actual == pub) {
     if (hashesCompressed(job_.addressMode)) {
       Hash160 h = hash160Of(actual, true);
-      if (targets_.contains(h)) hit = h;
+      if (targets_.contains(h)) hits.push_back(h);
     }
-    if (!hit && hashesUncompressed(job_.addressMode)) {
+    if (hashesUncompressed(job_.addressMode)) {
       Hash160 h = hash160Of(actual, false);
       if (targets_.contains(h)) {
-        hit = h;
-        compressedHit = false;
+        if (hits.empty()) compressedHit = false;
+        hits.push_back(h);
       }
     }
-    if (!hit && job_.pubkey && actual == *job_.pubkey) hit = hash160Of(actual, true);
+    if (hits.empty() && job_.pubkey && actual == *job_.pubkey) hits.push_back(hash160Of(actual, true));
   }
-  if (!hit) {
+  if (hits.empty()) {
     log(LogLevel::Warn, "rejected unverified candidate " + key.toHex());
     return false;
   }
@@ -97,11 +98,13 @@ bool RunContext::reportFound(const U256& key, const Affine& pub) {
   FoundKey fk;
   {
     std::lock_guard<std::mutex> lock(foundMu_);
+    // Recorded before the duplicate check: a repeat report may be the only one carrying the other encoding.
+    foundHashes_.insert(hits.begin(), hits.end());
     if (!foundKeys_.insert(key).second) return true;
-    foundHashes_.insert(*hit);
+    const Hash160& hit = hits.front();
     fk.time = isoTimeNow();
     fk.puzzle = job_.puzzle;
-    fk.address = encodeP2PKH(*hit);
+    fk.address = encodeP2PKH(hit);
     fk.pubkey = pubkeyHex(actual, compressedHit);
     fk.privkey = key.toHex(true);
     fk.wif = compressedHit ? wifCompressed(key) : wifUncompressed(key);
@@ -114,7 +117,7 @@ bool RunContext::reportFound(const U256& key, const Affine& pub) {
   return true;
 }
 
-void runThreads(RunContext& ctx, size_t n, const std::function<void(size_t)>& body) {
+void runThreads(size_t n, const std::function<void(size_t)>& body, const std::function<void()>& onFailure) {
   std::mutex mu;
   std::exception_ptr error;
   auto fail = [&](std::exception_ptr e) {
@@ -122,7 +125,7 @@ void runThreads(RunContext& ctx, size_t n, const std::function<void(size_t)>& bo
       std::lock_guard<std::mutex> lock(mu);
       if (!error) error = std::move(e);
     }
-    ctx.requestStop();
+    onFailure();
   };
   std::vector<std::thread> threads;
   try {
@@ -141,6 +144,10 @@ void runThreads(RunContext& ctx, size_t n, const std::function<void(size_t)>& bo
   }
   for (auto& t : threads) t.join();
   if (error) std::rethrow_exception(error);
+}
+
+void runThreads(RunContext& ctx, size_t n, const std::function<void(size_t)>& body) {
+  runThreads(n, body, [&ctx] { ctx.requestStop(); });
 }
 
 }  // namespace bsolver

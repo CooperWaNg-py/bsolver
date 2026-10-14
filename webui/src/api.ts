@@ -21,7 +21,13 @@ export class ApiError extends Error {
 export function consumeHashToken(): void {
   const hash = location.hash;
   if (!hash.startsWith('#token=')) return;
-  const token = decodeURIComponent(hash.slice('#token='.length));
+  const raw = hash.slice('#token='.length);
+  let token: string;
+  try {
+    token = decodeURIComponent(raw);
+  } catch {
+    token = raw; // malformed escape (e.g. a literal '%'): use the fragment as typed
+  }
   if (token) setStoredToken(token);
   history.replaceState(null, '', location.pathname + location.search);
 }
@@ -77,9 +83,7 @@ export function setToken(token: string): void {
 
 function waitForToken(): Promise<void> {
   setAuthNeeded(true);
-  const { promise, resolve } = Promise.withResolvers<void>();
-  tokenWaiters.push(resolve);
-  return promise;
+  return new Promise<void>((resolve) => tokenWaiters.push(resolve));
 }
 
 // ---------------------------------------------------------------------------

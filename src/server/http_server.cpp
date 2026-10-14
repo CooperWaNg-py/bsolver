@@ -45,6 +45,9 @@ std::string sseFrame(const std::string& type, const json& payload) {
   return "event: " + type + "\ndata: " + dumpJson(payload) + "\n\n";
 }
 
+constexpr std::chrono::seconds kEventPollSlice{1};
+constexpr std::chrono::seconds kEventPingInterval{15};
+
 const assets::Asset* findAsset(std::string_view path) {
   for (size_t i = 0; i < assets::kWebAssetsCount; ++i) {
     if (assets::kWebAssets[i].path == path) return &assets::kWebAssets[i];
@@ -105,6 +108,7 @@ struct HttpServer::EventClient {
   SseQueue queue{kEventQueueLimit};
   bool closed = false;
   int subscription = 0;
+  std::chrono::steady_clock::time_point lastWrite = std::chrono::steady_clock::now();  // provider thread only
 
   void push(const std::string& type, const json& payload) {
     const bool pinned =
@@ -249,8 +253,8 @@ void HttpServer::setupRoutes() {
       return sendError(res, 503, "too many event streams");
     }
     auto client = std::make_shared<EventClient>();
-    client->push("status", json(manager_.status()));
-    client->subscription = manager_.subscribe([client](const Event& e) { client->push(e.type, e.payload); });
+    client->subscription =
+        manager_.subscribe([client](const Event& e) { client->push(e.type, e.payload); }, /*initialStatus=*/true);
     {
       std::lock_guard<std::mutex> lock(clientsMu_);
       clients_.insert(client);
@@ -260,13 +264,21 @@ void HttpServer::setupRoutes() {
     res.set_chunked_content_provider(
         "text/event-stream",
         [client](size_t, httplib::DataSink& sink) {
+          using std::chrono::steady_clock;
           std::string out;
           {
             std::unique_lock<std::mutex> lock(client->mu);
-            client->cv.wait_for(lock, std::chrono::seconds(15), [&] { return !client->queue.empty() || client->closed; });
+            // httplib notices a vanished peer only between provider calls, so wait in short slices and probe the
+            // socket; otherwise a closed tab would hold its stream slot until the next ping.
+            auto ready = [&] { return !client->queue.empty() || client->closed; };
+            while (!client->cv.wait_for(lock, kEventPollSlice, ready)) {
+              if (!sink.is_writable()) return false;
+              if (steady_clock::now() - client->lastWrite >= kEventPingInterval) break;
+            }
             if (client->closed) return false;
             out = client->queue.empty() ? std::string(": ping\n\n") : client->queue.drain();
           }
+          client->lastWrite = steady_clock::now();
           return sink.write(out.data(), out.size());
         },
         [this, client](bool) {

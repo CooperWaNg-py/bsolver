@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -42,11 +43,10 @@ inline void prefetchRead(const void* p) {
 class BabyTable {
  public:
   explicit BabyTable(uint64_t m) {
-    unsigned bits = 1;
-    while ((uint64_t{1} << bits) < 2 * m) ++bits;
-    mask_ = (uint64_t{1} << bits) - 1;
-    shift_ = 64 - bits;
-    slots_.reset(new Slot[mask_ + 1]());
+    const uint64_t slots = bsgsTableSlots(m);
+    mask_ = slots - 1;
+    shift_ = 64 - static_cast<unsigned>(std::countr_zero(slots));
+    slots_.reset(new Slot[slots]());
   }
 
   uint64_t bytes() const { return (mask_ + 1) * sizeof(Slot); }
@@ -80,6 +80,7 @@ class BabyTable {
     uint64_t xlo;
     uint64_t j;
   };
+  static_assert(sizeof(Slot) == kBsgsSlotBytes);
   std::unique_ptr<Slot[]> slots_;
   uint64_t mask_ = 0;
   unsigned shift_ = 0;
@@ -251,8 +252,7 @@ bool runBsgs(RunContext& ctx) {
   const unsigned threads = effectiveThreads(ctx.spec().threads);
 
   const U256 W = job.width();
-  const U256 memLimit = U256::fromU64(std::max<uint64_t>(1, (uint64_t{ctx.spec().bsgsMemoryMb} << 20) / 32));
-  const uint64_t m = (W < memLimit ? W : memLimit).w[0];
+  const uint64_t m = bsgsBabySteps(W, ctx.spec().bsgsMemoryMb);
   const uint64_t s = 2 * m + 1;
   const U256 giants = divU64(W - 1, s) + 1;
   const U256 blocks = (giants + (kBlockGiants - 1)) >> kBlockShift;

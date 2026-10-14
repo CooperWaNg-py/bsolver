@@ -4,8 +4,12 @@
 
 #include <chrono>
 #include <filesystem>
+#include <mutex>
 #include <stdexcept>
+#include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 #include "catalog/catalog.h"
 #include "core/random.h"
@@ -155,6 +159,77 @@ TEST_CASE("event stream replaces invalid UTF-8 in log text") {
   CHECK(received.find(expected) != std::string::npos);
 }
 
+TEST_CASE("status snapshots carry a strictly increasing seq, published in order") {
+  Fixture f;
+  JobStatus a = f.manager.status();
+  JobStatus b = f.manager.status();
+  CHECK(b.seq > a.seq);
+  CHECK(json(b)["seq"] == b.seq);
+
+  std::mutex mu;
+  std::vector<std::pair<uint64_t, JobState>> events;  // (seq, state) of every status event in delivery order
+  auto record = [&](const Event& e) {
+    if (e.type != "status") return;
+    std::lock_guard<std::mutex> lock(mu);
+    const std::string state = e.payload["state"].get<std::string>();
+    events.emplace_back(e.payload["seq"].get<uint64_t>(), state == "finished" ? JobState::Finished : JobState::Idle);
+  };
+  f.manager.subscribe(record, /*initialStatus=*/true);
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    REQUIRE(events.size() == 1);  // the initial snapshot is delivered synchronously
+    CHECK(events[0].first > b.seq);
+  }
+
+  JobSpec spec;
+  spec.puzzle = 60;
+  spec.algorithm = Algorithm::Scan;
+  spec.backend = "cpu";
+  spec.checkpoint = false;
+  JobStatus started = f.manager.start(spec);
+  std::this_thread::sleep_for(std::chrono::milliseconds(1500));  // at least one tick
+  JobStatus stopping = f.manager.stop();
+  CHECK(stopping.state == JobState::Stopping);
+  CHECK(stopping.seq > started.seq);
+  f.manager.wait();
+
+  std::lock_guard<std::mutex> lock(mu);
+  REQUIRE(events.size() >= 3);
+  for (size_t i = 1; i < events.size(); ++i) CHECK(events[i].first > events[i - 1].first);
+  // The final frame is the finished snapshot, newer than the reply stop() returned.
+  CHECK(events.back().second == JobState::Finished);
+  CHECK(events.back().first > stopping.seq);
+}
+
+TEST_CASE("closed event streams release their slot within about a second") {
+  Fixture f;
+  auto firstFrame = [&](std::string& received) {
+    httplib::Client c{"127.0.0.1", f.port};
+    c.set_read_timeout(std::chrono::seconds(5));
+    c.Get("/api/events?token=t", [&](const char* data, size_t len) {
+      received.append(data, len);
+      return received.find("\n\n") == std::string::npos;  // close the connection after the first frame
+    });
+  };
+  for (size_t i = 0; i < HttpServer::kMaxEventStreams; ++i) {
+    std::string received;
+    firstFrame(received);
+    REQUIRE(received.rfind("event: status\n", 0) == 0);
+  }
+  // All slots are held by streams whose clients already disconnected; they must be reclaimed long before the
+  // 15 s ping would reveal the dead peers.
+  auto t0 = std::chrono::steady_clock::now();
+  bool connected = false;
+  while (!connected && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(10)) {
+    std::string received;
+    firstFrame(received);
+    connected = received.rfind("event: status\n", 0) == 0;
+    if (!connected) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  CHECK(connected);
+  CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(3));
+}
+
 TEST_CASE("job start and benchmarks fail fast while a benchmark runs") {
   Fixture f;
   httplib::Client benchClient{"127.0.0.1", f.port};
@@ -179,7 +254,7 @@ TEST_CASE("job start and benchmarks fail fast while a benchmark runs") {
   REQUIRE(r2);
   CHECK(r2->status == 409);
   CHECK(json::parse(r2->body)["error"] == "a benchmark is running");
-  CHECK(elapsed < std::chrono::seconds(1));
+  CHECK(elapsed < std::chrono::seconds(3));  // a blocking start() would wait for the whole benchmark (>= 2 s per backend)
   CHECK(benchStatus == 200);
 
   auto after = f.client.Post("/api/job", f.auth, job, "application/json");

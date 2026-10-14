@@ -2,6 +2,7 @@
 #include <nlohmann/json.hpp>
 
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <csignal>
@@ -12,6 +13,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 
 #if defined(_WIN32)
@@ -218,6 +220,24 @@ std::string resolveToken(const std::string& flag) {
   return randomTokenHex(16);
 }
 
+// Percent-encodes everything but RFC 3986 unreserved characters, so the token survives in a URL fragment and
+// decodeURIComponent restores it exactly.
+std::string percentEncode(std::string_view s) {
+  static constexpr char kHex[] = "0123456789ABCDEF";
+  std::string out;
+  for (char ch : s) {
+    auto c = static_cast<unsigned char>(ch);
+    if (std::isalnum(c) || c == '-' || c == '.' || c == '_' || c == '~') {
+      out += ch;
+    } else {
+      out += '%';
+      out += kHex[c >> 4];
+      out += kHex[c & 15];
+    }
+  }
+  return out;
+}
+
 std::unique_ptr<HttpServer> startWeb(JobManager& manager, const Catalog& catalog, const std::string& listen,
                                      const std::string& tokenFlag) {
   Listen l = parseListen(listen);
@@ -225,7 +245,7 @@ std::unique_ptr<HttpServer> startWeb(JobManager& manager, const Catalog& catalog
   auto server = std::make_unique<HttpServer>(manager, catalog, ServerOptions{l.host, l.port, token, true});
   int port = server->start();
   std::string host = l.host.find(':') != std::string::npos ? "[" + l.host + "]" : l.host;
-  consoleOut("Web UI: http://" + host + ":" + std::to_string(port) + "/#token=" + token);
+  consoleOut("Web UI: http://" + host + ":" + std::to_string(port) + "/#token=" + percentEncode(token));
   return server;
 }
 
@@ -431,7 +451,7 @@ int main(int argc, char** argv) {
       ->check(CLI::IsMember({"compressed", "uncompressed", "both"}));
   run->add_option("--backend", ro.backend, "Compute backend")
       ->check(CLI::IsMember({"auto", "cpu", "opencl", "metal", "cuda"}));
-  run->add_option("--threads", ro.threads, "CPU threads (0 = all)");
+  run->add_option("--threads", ro.threads, "CPU threads (0 = all)")->check(CLI::Range(0u, kMaxThreads));
   run->add_option("--devices", ro.devices, "GPU device indices (e.g. 0,1)")->delimiter(',');
   run->add_option("--bsgs-mem", ro.bsgsMem, "BSGS baby-step table memory (MB)");
   run->add_option("--dp", ro.dp, "Kangaroo distinguished-point bits");
@@ -463,7 +483,7 @@ int main(int argc, char** argv) {
   unsigned benchThreads = 0;
   bench->add_option("--algo", benchAlgo, "Algorithm")->check(CLI::IsMember({"scan", "kangaroo"}));
   bench->add_option("--seconds", benchSeconds, "Seconds per backend");
-  bench->add_option("--threads", benchThreads, "CPU threads (0 = all)");
+  bench->add_option("--threads", benchThreads, "CPU threads (0 = all)")->check(CLI::Range(0u, kMaxThreads));
 
   // pool
   auto* pool = app.add_subcommand(
@@ -483,7 +503,7 @@ int main(int argc, char** argv) {
   pool->add_option("--api-url", po.apiUrl, "Pool API base URL")->group("");
   pool->add_option("--backend", po.backend, "Compute backend (auto benchmarks once)")
       ->check(CLI::IsMember({"auto", "cpu", "opencl", "metal", "cuda"}));
-  pool->add_option("--threads", po.threads, "CPU threads (0 = all)");
+  pool->add_option("--threads", po.threads, "CPU threads (0 = all)")->check(CLI::Range(0u, kMaxThreads));
   pool->add_option("--devices", po.devices, "GPU device indices (e.g. 0,1)")->delimiter(',');
   pool->add_option("--ranges", po.ranges, "Stop after submitting N ranges");
   pool->add_option("--state-dir", po.stateDir, "Progress directory (range assignment + scan checkpoint)");

@@ -52,7 +52,9 @@ class JobManager {
   std::vector<BenchResult> bench(Algo algo, double seconds, unsigned threads = 0);
 
   // Callbacks run on manager threads and must not call subscribe/unsubscribe. Exceptions they throw are swallowed.
-  int subscribe(std::function<void(const Event&)> fn);
+  // Status events reach each subscriber in snapshot (seq) order. With initialStatus, fn first receives the current
+  // status on the calling thread, ordered before every later status event (an exception from it propagates).
+  int subscribe(std::function<void(const Event&)> fn, bool initialStatus = false);
   void unsubscribe(int id);
   // Blocks until no job is active.
   void wait();
@@ -72,8 +74,10 @@ class JobManager {
   void tickLoop(std::shared_ptr<ActiveJob> job);
   void onFound(const FoundKey& key);
   void publish(const Event& e);
-  JobStatus statusLocked() const;
-  void throwIfBusyLocked() const;  // ConflictError when a job is active/starting or a benchmark runs
+  void publishStatus();                // snapshot + publish, ordered with respect to other status events
+  void deliverLocked(const Event& e);  // requires subMu_
+  JobStatus statusLocked() const;      // requires mu_; assigns the next seq
+  void throwIfBusyLocked() const;      // ConflictError when a job is active/starting or a benchmark runs
   void joinThreads();
 
   const Catalog& catalog_;
@@ -82,6 +86,7 @@ class JobManager {
   mutable std::mutex mu_;
   std::condition_variable doneCv_;
   JobStatus st_;
+  mutable uint64_t seq_ = 0;  // guarded by mu_; last JobStatus::seq handed out
   std::shared_ptr<ActiveJob> job_;
   std::thread jobThread_, tickThread_;
   // start() and bench() claim these under mu_ and fail fast on conflict; thread joins happen outside mu_.

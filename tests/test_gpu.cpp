@@ -6,9 +6,11 @@
 
 #include "backend/backend.h"
 #include "catalog/catalog.h"
+#include "core/address.h"
 #include "core/gtable.h"
 #include "core/random.h"
 #include "core/ripemd160.h"
+#include "core/scalar.h"
 #include "engine/job_manager.h"
 #include "engine/kangaroo_params.h"
 
@@ -163,6 +165,41 @@ void checkKangarooJob(std::string_view id) {
   CHECK(st.found[0].privkey == std::string(52, '0') + "ade6d7ce3b9b");
   CHECK(st.backend == std::string(id));
 }
+
+// Keys within GPU_GROUP of n hit the kernel's dx == 0 cases; the runner scans keys >= n - 2^20 on the CPU instead.
+// Sequential: the range crosses that limit mid-segment and its first key is a GPU key. Random: the range is narrower
+// than any GPU segment (>= 512 threads * 64 keys), so every draw covers all of it.
+void checkScanJobNearOrder(std::string_view id, Order order) {
+  gpuBackend(id);
+  const bool random = order == Order::Random;
+  const U256 first = kOrderN - (random ? uint64_t{1} << 14 : (uint64_t{1} << 21) - 5);
+  const std::vector<U256> keys = {first, kOrderN - 64, kOrderN - 2};
+  JobSpec s;
+  for (const U256& k : keys) {
+    uint8_t buf[33], h[20];
+    serializeCompressed(mulG(k), buf);
+    hash160_33(buf, h);
+    s.addresses.push_back(encodeP2PKH(h));
+  }
+  s.rangeStart = (kOrderN - (random ? uint64_t{1} << 15 : uint64_t{1} << 24)).toHex();
+  s.rangeEnd = (kOrderN - 1).toHex();
+  s.algorithm = Algorithm::Scan;
+  s.order = order;
+  s.backend = std::string(id);
+  s.checkpoint = false;
+  TempDir dir;
+  JobManager m(catalog(), ManagerOptions{dir.path / "state", dir.path / "found.jsonl"});
+  m.start(s);
+  m.wait();
+  JobStatus st = m.status();
+  REQUIRE(st.outcome == Outcome::Found);
+  std::vector<std::string> found;
+  for (const auto& f : st.found) found.push_back(f.privkey);
+  std::sort(found.begin(), found.end());
+  std::vector<std::string> expected;
+  for (const U256& k : keys) expected.push_back(k.toHex(true));
+  CHECK(found == expected);
+}
 }  // namespace
 
 #define BSOLVER_GPU_TESTS(ID)                                                                   \
@@ -170,7 +207,11 @@ void checkKangarooJob(std::string_view id) {
   TEST_CASE(ID " scan worker: no candidate for a random target", "[gpu]") { checkScanRandomTarget(ID); } \
   TEST_CASE(ID " scan worker: uncompressed keys", "[gpu]") { checkScanUncompressed(ID); }   \
   TEST_CASE(ID " kangaroo worker state and DPs verify", "[gpu]") { checkKangarooWorker(ID); } \
-  TEST_CASE(ID " kangaroo job finds puzzle 48", "[gpu]") { checkKangarooJob(ID); }
+  TEST_CASE(ID " kangaroo job finds puzzle 48", "[gpu]") { checkKangarooJob(ID); }            \
+  TEST_CASE(ID " sequential scan job finds keys near n", "[gpu]") {                           \
+    checkScanJobNearOrder(ID, Order::Sequential);                                             \
+  }                                                                                           \
+  TEST_CASE(ID " random scan job finds keys near n", "[gpu]") { checkScanJobNearOrder(ID, Order::Random); }
 
 BSOLVER_GPU_TESTS("opencl")
 BSOLVER_GPU_TESTS("metal")

@@ -3,15 +3,15 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <mutex>
+#include <functional>
 #include <stdexcept>
-#include <thread>
 
 #include "backend/backend.h"
 #include "catalog/catalog.h"
 #include "core/gtable.h"
 #include "core/random.h"
 #include "engine/kangaroo_params.h"
+#include "engine/run_context.h"
 #include "engine/segment_source.h"
 
 namespace bsolver {
@@ -21,24 +21,12 @@ using Clock = std::chrono::steady_clock;
 
 const U256 kPuzzle28Key = U256::fromU64(0xd916ce8);
 
-// Runs fn(i) for every i in [0, n) on its own thread; rethrows the first exception.
-template <class Fn>
-void forEachConcurrently(size_t n, Fn&& fn) {
-  std::mutex mu;
-  std::exception_ptr error;
-  std::vector<std::thread> threads;
-  for (size_t i = 0; i < n; ++i) {
-    threads.emplace_back([&, i] {
-      try {
-        fn(i);
-      } catch (...) {
-        std::lock_guard<std::mutex> lock(mu);
-        if (!error) error = std::current_exception();
-      }
-    });
-  }
-  for (auto& t : threads) t.join();
-  if (error) std::rethrow_exception(error);
+// Runs fn(i) for every i in [0, n) on its own thread. On failure *stop (if non-null) is set so the throughput loops
+// end early; every started thread is joined and the first exception rethrown.
+void forEachConcurrently(size_t n, std::atomic<bool>* stop, const std::function<void(size_t)>& fn) {
+  runThreads(n, fn, [stop] {
+    if (stop) *stop = true;
+  });
 }
 
 std::array<uint8_t, 20> randomHash(Rng& rng) {
@@ -53,7 +41,7 @@ void checkScan(Backend& b, const BenchOptions& opt) {
   ScanSetup setup{{p28->hash160}, AddressMode::Compressed};
   auto workers = b.createScanWorkers(setup, opt.devices, opt.threads);
   if (workers.empty()) throw std::runtime_error("no workers");
-  forEachConcurrently(workers.size(), [&](size_t i) {
+  forEachConcurrently(workers.size(), nullptr, [&](size_t i) {
     ScanWorker& w = *workers[i];
     std::vector<U256> candidates;
     uint64_t count = std::min<uint64_t>(w.segmentKeys(), uint64_t{1} << 22);
@@ -71,7 +59,8 @@ double scanThroughput(Backend& b, const BenchOptions& opt) {
   const U256 base = U256::fromU64(1) << 70;
   SequentialSource source(base, base + (U256::fromU64(1) << 60), base);
   std::vector<double> rates(workers.size(), 0);
-  forEachConcurrently(workers.size(), [&](size_t i) {
+  std::atomic<bool> stop{false};
+  forEachConcurrently(workers.size(), &stop, [&](size_t i) {
     ScanWorker& w = *workers[i];
     std::vector<U256> candidates;
     U256 s;
@@ -81,7 +70,7 @@ double scanThroughput(Backend& b, const BenchOptions& opt) {
     double work = 0;
     auto t0 = Clock::now();
     double elapsed = 0;
-    while (elapsed < opt.seconds) {
+    while (elapsed < opt.seconds && !stop) {
       source.next(w.segmentKeys(), &s, &n);
       w.process(s, n, candidates);
       work += static_cast<double>(n);
@@ -123,7 +112,7 @@ void checkKangaroo(Backend& b, const BenchOptions& opt) {
   const Affine wildBase = wildBaseFor(q, a);
   auto params =
       layoutHerd(makeKangarooParams(width, wildBase, 8, makeJumpDistances(width, totalKangaroos(workers), rng)), workers);
-  forEachConcurrently(workers.size(), [&](size_t i) {
+  forEachConcurrently(workers.size(), nullptr, [&](size_t i) {
     KangarooWorker& w = *workers[i];
     w.init(params[i], 0x5eed0000 + i);
     std::vector<Dp> dps;
@@ -155,7 +144,8 @@ double kangarooThroughput(Backend& b, const BenchOptions& opt) {
                            workers);
   const uint64_t seed = rng.next();
   std::vector<double> rates(workers.size(), 0);
-  forEachConcurrently(workers.size(), [&](size_t i) {
+  std::atomic<bool> stop{false};
+  forEachConcurrently(workers.size(), &stop, [&](size_t i) {
     KangarooWorker& w = *workers[i];
     w.init(params[i], seed + i);
     std::vector<Dp> dps;
@@ -163,7 +153,7 @@ double kangarooThroughput(Backend& b, const BenchOptions& opt) {
     double jumps = 0;
     auto t0 = Clock::now();
     double elapsed = 0;
-    while (elapsed < opt.seconds) {
+    while (elapsed < opt.seconds && !stop) {
       dps.clear();
       jumps += static_cast<double>(w.step(dps));
       elapsed = std::chrono::duration<double>(Clock::now() - t0).count();

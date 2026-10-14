@@ -72,10 +72,15 @@ class SnapshotScope {
     done_ = true;
     if (complete) {
       c_.remove();
-    } else {
-      c_.saveNow();
-      c_.clearSnapshot();
+      return;
     }
+    try {
+      c_.saveNow();
+    } catch (...) {
+      c_.clearSnapshot();  // the snapshot references the runner's locals, which unwinding destroys
+      throw;
+    }
+    c_.clearSnapshot();
   }
   ~SnapshotScope() {
     if (done_) return;

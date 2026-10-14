@@ -31,8 +31,12 @@ class PoolError : public std::runtime_error {
   bool retryable_;
 };
 
+// Why the range cannot be scanned (starts at key 0, wraps past 2^256 or ends at/after the secp256k1 order), or ""
+// when its keys all lie in [1, n-1].
+std::string rangeBoundsError(const PoolRange& r);
+
 // Parses the GET /puzzle/{n}/range response. Throws PoolError (not retryable) when fields are missing/invalid or,
-// with checkBounds, when the range starts at 0, wraps past 2^256 or ends at/after the secp256k1 order.
+// with checkBounds, when rangeBoundsError() reports a problem.
 PoolRange parseRangeResponse(const std::string& body, bool checkBounds = true);
 
 // SHA256 over the concatenated proof keys (64 uppercase hex digits each, in proofAddresses order), lowercase hex:

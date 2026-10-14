@@ -1,6 +1,7 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import { api, errorMessage } from '../api';
 import type { BenchResult } from '../types';
+import { MAX_BENCH_SECONDS } from '../types';
 import { BenchTable, ErrorBox } from './common';
 
 export function Benchmark() {
@@ -22,8 +23,8 @@ export function Benchmark() {
   const onSubmit = async (e: FormEvent) => {
     e.preventDefault();
     const secs = Number(seconds);
-    if (!Number.isFinite(secs) || secs <= 0 || secs > 600) {
-      setError('seconds must be a number between 0 and 600');
+    if (!Number.isFinite(secs) || secs <= 0 || secs > MAX_BENCH_SECONDS) {
+      setError(`seconds must be a number in (0, ${MAX_BENCH_SECONDS}]`);
       return;
     }
     setError(null);
@@ -54,7 +55,14 @@ export function Benchmark() {
         </label>
         <label>
           Seconds per backend{' '}
-          <input type="number" min={0.5} step={0.5} value={seconds} onChange={(e) => setSeconds(e.target.value)} />
+          <input
+            type="number"
+            min={0.5}
+            max={MAX_BENCH_SECONDS}
+            step={0.5}
+            value={seconds}
+            onChange={(e) => setSeconds(e.target.value)}
+          />
         </label>
         <button type="submit" className="btn primary" disabled={running}>
           {running ? `Running… ${elapsed.toFixed(0)}s` : 'Run benchmark'}

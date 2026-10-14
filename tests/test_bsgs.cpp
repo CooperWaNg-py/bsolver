@@ -84,6 +84,19 @@ TEST_CASE("bsgs finds a key at the range end") {
   requireFound(runToEnd(pubkeyRange(30, kKey30 - 5000, kKey30), dir), kKey30);
 }
 
+TEST_CASE("bsgs covers ranges of width 1 to 3") {
+  for (uint64_t width = 1; width <= 3; ++width) {
+    for (uint64_t off = 0; off < width; ++off) {
+      TempDir dir;
+      INFO("width " << width << ", key at offset " << off);
+      requireFound(runToEnd(pubkeyRange(30, kKey30 - off, kKey30 - off + (width - 1)), dir), kKey30);
+    }
+    TempDir dir;
+    JobStatus st = runToEnd(pubkeyRange(30, kKey30 + 1, kKey30 + width), dir);
+    CHECK(st.outcome == Outcome::Exhausted);
+  }
+}
+
 TEST_CASE("bsgs finds a key at the end of a multi-lane range") {
   TempDir dir;
   JobSpec s = pubkeyRange(30, U256::fromU64(2), kKey30);

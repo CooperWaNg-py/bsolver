@@ -3,6 +3,7 @@
 
 #include "backend/cpu/cpu_scan_worker.h"
 #include "core/gtable.h"
+#include "core/scalar.h"
 #include "engine/bytes.h"
 #include "engine/runners.h"
 #include "engine/segment_source.h"
@@ -11,9 +12,19 @@ namespace bsolver {
 
 namespace {
 const U256 kSmallLimit = U256::fromU64(uint64_t{1} << 20);
+// Keys >= n - 2^20 never go to GPU workers either: their kernels have no fallback for the dx == 0 cases within
+// GPU_GROUP keys of n. Those keys are scanned by a CPU worker inside the segment that contains them.
+const U256 kTopLimit = kOrderN - kSmallLimit;
 
 void verifyCandidates(RunContext& ctx, const std::vector<U256>& candidates) {
   for (const U256& c : candidates) ctx.reportFound(c, mulG(c));
+}
+
+// Number of keys of [s, s + n) below kTopLimit.
+uint64_t keysBelowTop(const U256& s, uint64_t n) {
+  if (!(s < kTopLimit)) return 0;
+  const U256 room = kTopLimit - s;
+  return room < U256::fromU64(n) ? room.w[0] : n;
 }
 }  // namespace
 
@@ -40,7 +51,8 @@ bool runScan(RunContext& ctx, Backend& backend) {
                                 (sequential ? " at " + cursor.toHex() : std::string()));
   }
 
-  // Keys below 2^20 never go to the workers (GPU kernels assume no small-key edge cases).
+  // Keys below 2^20 never go to the workers (GPU kernels assume no small-key edge cases); keys >= kTopLimit go to a
+  // CPU worker instead of a GPU one (see kTopLimit).
   bool prefixDone = true;
   if (cursor < kSmallLimit && !(job.rangeEnd < cursor)) {
     U256 prefixEnd = job.rangeEnd < kSmallLimit ? job.rangeEnd : kSmallLimit - 1;
@@ -86,9 +98,11 @@ bool runScan(RunContext& ctx, Backend& backend) {
 
   if (!ctx.shouldStop() && ((seq && !seq->finished()) || rnd)) {
     auto workers = backend.createScanWorkers(setup, ctx.spec().devices, ctx.spec().threads);
+    const bool clipTop = backend.id() != "cpu";
     if (workers.empty()) throw std::runtime_error("backend " + std::string(backend.id()) + " created no workers");
     runThreads(ctx, workers.size(), [&](size_t i) {
       ScanWorker* w = workers[i].get();
+      std::unique_ptr<ScanWorker> topWorker;  // created on first use
       try {
         std::vector<U256> candidates;
         while (!ctx.shouldStop()) {
@@ -99,7 +113,16 @@ bool runScan(RunContext& ctx, Backend& backend) {
           bool ok = seq ? seq->next(w->segmentKeys(), &s, &n) : rnd->next(w->segmentKeys(), &s, &n);
           if (!ok) break;
           candidates.clear();
-          w->process(s, n, candidates);
+          const uint64_t below = clipTop ? keysBelowTop(s, n) : n;
+          if (below != 0) w->process(s, below, candidates);
+          if (below < n) {
+            if (!topWorker) topWorker = makeCpuScanWorker(setup, 0);
+            for (uint64_t done = below; done < n;) {
+              const uint64_t len = std::min(n - done, topWorker->segmentKeys());
+              topWorker->process(s + done, len, candidates);
+              done += len;
+            }
+          }
           verifyCandidates(ctx, candidates);
           if (seq) seq->complete(s);
           ctx.addWork(static_cast<double>(n));

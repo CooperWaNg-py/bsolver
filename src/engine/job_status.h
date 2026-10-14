@@ -26,6 +26,9 @@ inline bool isActive(JobState s) {
 
 struct JobStatus {
   uint64_t id = 0;
+  // Snapshot sequence number, strictly increasing across every status() snapshot of the process: of two snapshots of
+  // the same job, the one with the higher seq is the newer.
+  uint64_t seq = 0;
   JobState state = JobState::Idle;
   std::optional<Outcome> outcome;
   std::optional<std::string> error;

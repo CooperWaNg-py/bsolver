@@ -37,6 +37,7 @@ void to_json(nlohmann::json& j, const JobStatus& s) {
   auto optStr = [](const auto& o) { return o ? nlohmann::json(std::string(toString(*o))) : nlohmann::json(nullptr); };
   j = nlohmann::json{
       {"id", s.id},
+      {"seq", s.seq},
       {"state", toString(s.state)},
       {"outcome", optStr(s.outcome)},
       {"error", opt(s.error)},

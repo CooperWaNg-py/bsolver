@@ -50,6 +50,8 @@ export type RateUnit = 'keys/s' | 'jumps/s';
 
 export type JobStatus = {
   id: number;
+  /** Snapshot sequence number; of two snapshots of the same job, the higher seq is newer. */
+  seq: number;
   state: JobState;
   outcome: JobOutcome | null;
   error: string | null;
@@ -106,3 +108,7 @@ export type LogEvent = { time: string; level: LogLevel; message: string };
 export type BenchRequest = { algorithm: 'scan' | 'kangaroo'; seconds: number };
 
 export const ACTIVE_STATES: readonly JobState[] = ['benchmarking', 'running', 'paused', 'stopping'];
+
+/** Server-side limits (kMaxThreads in job_spec.h, the /api/bench seconds check in http_server.cpp). */
+export const MAX_THREADS = 1024;
+export const MAX_BENCH_SECONDS = 60;

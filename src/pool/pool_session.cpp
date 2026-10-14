@@ -33,6 +33,11 @@ std::string joined(const std::vector<std::string>& v, const char* sep) {
   for (const auto& x : v) s += (s.empty() ? "" : sep) + x;
   return s;
 }
+
+// Checkpointer::restore's error for an unreadable (torn or truncated) checkpoint file.
+bool isCorruptCheckpointError(const std::string& error) {
+  return error.rfind("checkpoint ", 0) == 0 && error.find(" is corrupt") != std::string::npos;
+}
 }  // namespace
 
 PoolSession::PoolSession(JobManager& manager, PoolSessionOptions options)
@@ -97,7 +102,6 @@ void PoolSession::dropAssignment() {
     state_.save(statePath_);
   }
   setPingHex({});
-  resumedAssignment_ = false;
 }
 
 std::string PoolSession::keyChannels() const {
@@ -156,6 +160,14 @@ void PoolSession::setup() {
     loaded->workerName.clear();
   }
   state_ = loaded.value_or(PoolState{});
+  if (state_.assignment) {
+    const std::string bad = rangeBoundsError(state_.assignment->range);
+    if (!bad.empty()) {
+      log(LogLevel::Error, "saved range " + display(state_.assignment->range.hex) + " cannot be scanned (" + bad +
+                               "); dropping it and fetching a new range");
+      state_.assignment.reset();
+    }
+  }
   state_.puzzle = cfg.targetPuzzle;
   state_.tokenId = tokenId;
   if (!cfg.workerName.empty()) {
@@ -197,7 +209,6 @@ void PoolSession::setup() {
                             std::to_string(a.proofKeys.size()) + "/" + std::to_string(a.range.proofAddresses.size()) +
                             " proof keys found" + (a.scanComplete ? ", scan complete" : "") + ")");
     setPingHex(a.range.hex);
-    resumedAssignment_ = true;
   }
 }
 
@@ -261,7 +272,6 @@ bool PoolSession::fetchAssignment() {
         state_.save(statePath_);
       }
       setPingHex(r.hex);
-      resumedAssignment_ = false;
       char bits[32];
       std::snprintf(bits, sizeof(bits), "2^%.2f", std::log2((r.end() - r.start() + 1).toDouble()));
       log(LogLevel::Info, "assigned range " + display(r.hex) + " (" + std::to_string(r.proofAddresses.size()) +
@@ -295,29 +305,35 @@ bool PoolSession::scanAssignment() {
   spec.checkpoint = true;
   spec.stopOnFound = false;  // the whole range must be covered to find every proof key (and the target)
 
-  try {
+  // Engine rejections (JobError) are fatal: fetched ranges passed parseRangeResponse and setup() dropped any saved
+  // range outside the key space, so what remains is a local configuration problem that would fail every range.
+  for (;;) {
     manager_.start(spec);
-  } catch (const JobError& ex) {
-    // A freshly fetched range passed parseRangeResponse, so a rejection is a local configuration problem.
-    if (!resumedAssignment_) throw;
-    log(LogLevel::Error, "saved range " + display(r.hex) + " cannot be scanned (" + ex.what() +
-                             "); dropping it and fetching a new range");
-    dropAssignment();
-    return true;
-  }
-  if (stop_) {
-    try {
-      manager_.stop();
-    } catch (const ConflictError&) {
+    if (stop_) {
+      try {
+        manager_.stop();
+      } catch (const ConflictError&) {
+      }
     }
-  }
-  manager_.wait();
-  JobStatus st = manager_.status();
-  if (st.state == JobState::Failed) throw std::runtime_error("scan failed: " + st.error.value_or("unknown error"));
-  if (!st.exhausted) {
-    // Stopped (Ctrl-C or the web UI): the checkpoint and the assignment stay for the next start.
-    stop_ = true;
-    return false;
+    manager_.wait();
+    JobStatus st = manager_.status();
+    if (st.state == JobState::Failed) {
+      const std::string err = st.error.value_or("unknown error");
+      if (!spec.fresh && !stop_ && isCorruptCheckpointError(err)) {
+        // A crash or power loss can leave a torn checkpoint (the engine logged its path); rescanning the pool range
+        // from its start is always correct.
+        log(LogLevel::Warn, "range " + display(r.hex) + " has a corrupt scan checkpoint; rescanning it from its start");
+        spec.fresh = true;
+        continue;
+      }
+      throw std::runtime_error("scan failed: " + err);
+    }
+    if (!st.exhausted) {
+      // Stopped (Ctrl-C or the web UI): the checkpoint and the assignment stay for the next start.
+      stop_ = true;
+      return false;
+    }
+    break;
   }
   std::lock_guard<std::mutex> lock(stateMu_);
   state_.assignment->scanComplete = true;
@@ -388,7 +404,6 @@ bool PoolSession::submitAssignment() {
     total = state_.rangesSubmitted;
   }
   setPingHex({});
-  resumedAssignment_ = false;
   submittedThisRun_++;
   log(LogLevel::Info, "range " + display(r.hex) + " submitted (" + std::to_string(total) + " total)");
   const std::string msg = "\u2705 " + r.hex + " scanned by " + state_.workerName + " (" + shortHash(api_->securityHash()) + ")";
