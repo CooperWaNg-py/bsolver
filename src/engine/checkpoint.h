@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "engine/bytes.h"
 #include "engine/types.h"
 
 namespace bsolver {
@@ -29,6 +30,10 @@ class Checkpointer {
   // Algorithm payload of an existing checkpoint, or nullopt when disabled/fresh/missing.
   // Throws std::runtime_error("checkpoint <path> does not match this job") on identity mismatch.
   std::optional<std::vector<uint8_t>> load();
+  // load() and hand the payload to parse; returns false when there is nothing to resume. A payload parse cannot
+  // read (truncated, trailing bytes, or a value it rejects by throwing std::runtime_error) throws
+  // std::runtime_error("checkpoint <path> is corrupt (use --fresh)").
+  bool restore(const std::function<void(ByteReader&)>& parse);
 
   // The runner registers a thread-safe payload snapshot function.
   void setSnapshot(std::function<std::vector<uint8_t>()> fn);

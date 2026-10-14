@@ -43,13 +43,26 @@ HttpResponse httpRequest(const HttpRequest& r) {
 
   std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> curl(curl_easy_init(), curl_easy_cleanup);
   if (!curl) throw std::runtime_error("curl_easy_init failed");
-  curl_slist* list = nullptr;
-  for (const auto& [k, v] : r.headers) list = curl_slist_append(list, (k + ": " + v).c_str());
-  std::unique_ptr<curl_slist, decltype(&curl_slist_free_all)> headers(list, curl_slist_free_all);
+  std::unique_ptr<curl_slist, decltype(&curl_slist_free_all)> headers(nullptr, curl_slist_free_all);
+  for (const auto& [k, v] : r.headers) {
+    // Returns the (unchanged) head, or nullptr on allocation failure with the list left intact.
+    curl_slist* head = curl_slist_append(headers.get(), (k + ": " + v).c_str());
+    if (!head) throw std::runtime_error("HTTP request failed: cannot build request headers");
+    if (!headers) headers.reset(head);
+  }
 
   HttpResponse res;
   CURL* c = curl.get();
   curl_easy_setopt(c, CURLOPT_URL, r.url.c_str());
+  // Config-supplied URLs: no file://, ftp:// etc. Redirects are not followed (libcurl default).
+#if LIBCURL_VERSION_NUM >= 0x075500  // 7.85.0 added CURLOPT_PROTOCOLS_STR and deprecated CURLOPT_PROTOCOLS
+  CURLcode protoRc = curl_easy_setopt(c, CURLOPT_PROTOCOLS_STR, "http,https");
+#else
+  CURLcode protoRc = curl_easy_setopt(c, CURLOPT_PROTOCOLS, static_cast<long>(CURLPROTO_HTTP | CURLPROTO_HTTPS));
+#endif
+  if (protoRc != CURLE_OK) {
+    throw std::runtime_error(std::string("HTTP request failed: ") + curl_easy_strerror(protoRc));
+  }
   curl_easy_setopt(c, CURLOPT_USERAGENT, kUserAgent.c_str());
   curl_easy_setopt(c, CURLOPT_HTTPHEADER, headers.get());
   curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
@@ -104,6 +117,9 @@ HttpResponse httpRequest(const HttpRequest& r) {
   uc.dwUrlPathLength = static_cast<DWORD>(-1);
   uc.dwExtraInfoLength = static_cast<DWORD>(-1);
   if (!WinHttpCrackUrl(url.c_str(), 0, 0, &uc)) fail("invalid URL");
+  if (uc.nScheme != INTERNET_SCHEME_HTTP && uc.nScheme != INTERNET_SCHEME_HTTPS) {
+    throw std::runtime_error("HTTP request failed: only http:// and https:// URLs are supported");
+  }
   std::wstring host(uc.lpszHostName, uc.dwHostNameLength);
   std::wstring object(uc.lpszUrlPath, uc.dwUrlPathLength);
   if (uc.lpszExtraInfo) object.append(uc.lpszExtraInfo, uc.dwExtraInfoLength);
@@ -120,6 +136,11 @@ HttpResponse httpRequest(const HttpRequest& r) {
   Handle request(WinHttpOpenRequest(connection.get(), widen(r.method).c_str(), object.c_str(), nullptr,
                                     WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags));
   if (!request) fail("open request");
+  // Match libcurl: never follow redirects (they would resend the UserToken header to the new location).
+  DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+  if (!WinHttpSetOption(request.get(), WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy, sizeof(redirectPolicy))) {
+    fail("disable redirects");
+  }
 
   std::wstring headers;
   for (const auto& [k, v] : r.headers) headers += widen(k + ": " + v + "\r\n");

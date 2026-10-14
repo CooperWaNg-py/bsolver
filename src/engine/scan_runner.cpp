@@ -1,7 +1,5 @@
 #include <memory>
-#include <mutex>
 #include <stdexcept>
-#include <thread>
 
 #include "backend/cpu/cpu_scan_worker.h"
 #include "core/gtable.h"
@@ -19,42 +17,46 @@ void verifyCandidates(RunContext& ctx, const std::vector<U256>& candidates) {
 }
 }  // namespace
 
+// Payload: sequential `U256 cursor, u64 keysDone` (keysDone = cursor - rangeStart); random `u64 keysDone,
+// U256 prefixCursor` (keys tested, and how far the sequential small-key prefix got).
 bool runScan(RunContext& ctx, Backend& backend) {
   const ResolvedJob& job = ctx.job();
   const bool sequential = job.order == Order::Sequential;
   ScanSetup setup{job.targets, job.addressMode};
 
+  // Every key in [rangeStart, cursor) is done: the whole range in sequential order, the small-key prefix in random.
   U256 cursor = job.rangeStart;
-  if (auto payload = ctx.checkpointer().load()) {
-    ByteReader r(*payload);
-    if (sequential) cursor = r.u256();
-    uint64_t keysDone = r.u64();
-    ctx.addResumedWork(static_cast<double>(keysDone));
+  uint64_t keysDone = 0;
+  if (ctx.checkpointer().restore([&](ByteReader& r) {
+        if (sequential) cursor = r.u256();
+        keysDone = r.u64();
+        // Random checkpoints written before the prefix cursor existed end here.
+        if (!sequential && r.remaining() != 0) cursor = r.u256();
+        if (cursor < job.rangeStart || job.rangeEnd + 1 < cursor) throw std::runtime_error("cursor out of range");
+      })) {
+    ctx.addResumedWork(sequential ? (cursor - job.rangeStart).toDouble() : static_cast<double>(keysDone));
     ctx.setResumed(true);
     ctx.log(LogLevel::Info, "resuming from checkpoint " + ctx.checkpointer().path().string() +
                                 (sequential ? " at " + cursor.toHex() : std::string()));
   }
 
   // Keys below 2^20 never go to the workers (GPU kernels assume no small-key edge cases).
-  U256 prefixStart = sequential ? cursor : job.rangeStart;
   bool prefixDone = true;
-  if (prefixStart < kSmallLimit && !(job.rangeEnd < prefixStart)) {
+  if (cursor < kSmallLimit && !(job.rangeEnd < cursor)) {
     U256 prefixEnd = job.rangeEnd < kSmallLimit ? job.rangeEnd : kSmallLimit - 1;
     auto cpu = makeCpuScanWorker(setup, 0);
     std::vector<U256> candidates;
-    U256 s = prefixStart;
-    while (!(prefixEnd < s)) {
+    while (!(prefixEnd < cursor)) {
       ctx.waitIfPaused();
       if (ctx.shouldStop()) break;
-      uint64_t n = std::min<uint64_t>(uint64_t{1} << 16, (prefixEnd - s).w[0] + 1);
+      uint64_t n = std::min<uint64_t>(uint64_t{1} << 16, (prefixEnd - cursor).w[0] + 1);
       candidates.clear();
-      cpu->process(s, n, candidates);
+      cpu->process(cursor, n, candidates);
       verifyCandidates(ctx, candidates);
       ctx.addWork(static_cast<double>(n));
-      s = s + n;
+      cursor = cursor + n;
     }
-    prefixDone = prefixEnd < s;
-    if (sequential) cursor = s;
+    prefixDone = prefixEnd < cursor;
   }
 
   const U256 mainStart = sequential ? cursor : (job.rangeStart < kSmallLimit ? kSmallLimit : job.rangeStart);
@@ -68,43 +70,44 @@ bool runScan(RunContext& ctx, Backend& backend) {
 
   SnapshotScope snapshot(ctx.checkpointer(), [&] {
     ByteWriter w;
-    if (seq) w.u256(seq->resumeCursor());
-    w.u64(static_cast<uint64_t>(ctx.workDone()));
+    if (sequential) {
+      // Saved progress is what the resume cursor covers, not the live count (segments done past an in-flight one
+      // are rescanned after a resume).
+      const U256 resume = seq->resumeCursor();
+      const U256 done = resume - job.rangeStart;
+      w.u256(resume);
+      w.u64(done.bitLength() > 64 ? UINT64_MAX : done.w[0]);
+    } else {
+      w.u64(static_cast<uint64_t>(ctx.workDone()));
+      w.u256(cursor);
+    }
     return std::move(w.data());
   });
 
   if (!ctx.shouldStop() && ((seq && !seq->finished()) || rnd)) {
     auto workers = backend.createScanWorkers(setup, ctx.spec().devices, ctx.spec().threads);
     if (workers.empty()) throw std::runtime_error("backend " + std::string(backend.id()) + " created no workers");
-    std::mutex errMu;
-    std::string error;
-    std::vector<std::thread> threads;
-    for (auto& worker : workers) {
-      threads.emplace_back([&, w = worker.get()] {
-        try {
-          std::vector<U256> candidates;
-          while (!ctx.shouldStop()) {
-            ctx.waitIfPaused();
-            if (ctx.shouldStop()) break;
-            U256 s;
-            uint64_t n = 0;
-            bool ok = seq ? seq->next(w->segmentKeys(), &s, &n) : rnd->next(w->segmentKeys(), &s, &n);
-            if (!ok) break;
-            candidates.clear();
-            w->process(s, n, candidates);
-            verifyCandidates(ctx, candidates);
-            if (seq) seq->complete(s);
-            ctx.addWork(static_cast<double>(n));
-          }
-        } catch (const std::exception& ex) {
-          std::lock_guard<std::mutex> lock(errMu);
-          if (error.empty()) error = w->label() + ": " + ex.what();
-          ctx.requestStop();
+    runThreads(ctx, workers.size(), [&](size_t i) {
+      ScanWorker* w = workers[i].get();
+      try {
+        std::vector<U256> candidates;
+        while (!ctx.shouldStop()) {
+          ctx.waitIfPaused();
+          if (ctx.shouldStop()) break;
+          U256 s;
+          uint64_t n = 0;
+          bool ok = seq ? seq->next(w->segmentKeys(), &s, &n) : rnd->next(w->segmentKeys(), &s, &n);
+          if (!ok) break;
+          candidates.clear();
+          w->process(s, n, candidates);
+          verifyCandidates(ctx, candidates);
+          if (seq) seq->complete(s);
+          ctx.addWork(static_cast<double>(n));
         }
-      });
-    }
-    for (auto& t : threads) t.join();
-    if (!error.empty()) throw std::runtime_error(error);
+      } catch (const std::exception& ex) {
+        throw std::runtime_error(w->label() + ": " + ex.what());
+      }
+    });
   }
 
   // Random order is exhausted only when the small-key prefix covered the whole range.

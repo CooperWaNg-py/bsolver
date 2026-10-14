@@ -21,7 +21,6 @@ struct U256 {
   std::string toHex(bool pad64 = false) const;
   bool isZero() const { return (w[0] | w[1] | w[2] | w[3]) == 0; }
   unsigned bitLength() const;
-  bool bit(unsigned i) const { return (w[i >> 6] >> (i & 63)) & 1; }
   double toDouble() const;
   long double toLongDouble() const;
   static U256 fromLongDouble(long double v);  // truncates; v must be in [0, 2^256)

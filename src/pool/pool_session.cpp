@@ -21,6 +21,11 @@ std::string upper(std::string s) {
   return s;
 }
 
+std::string lower(std::string s) {
+  std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return s;
+}
+
 std::string shortHash(const std::string& h) { return h.size() < 8 ? h : h.substr(0, 4) + "..." + h.substr(h.size() - 4); }
 
 std::string joined(const std::vector<std::string>& v, const char* sep) {
@@ -78,6 +83,28 @@ std::string PoolSession::display(const std::string& hex) const {
 void PoolSession::saveState() {
   std::lock_guard<std::mutex> lock(stateMu_);
   state_.save(statePath_);
+}
+
+void PoolSession::setPingHex(const std::string& hex) {
+  std::lock_guard<std::mutex> lock(pingMu_);
+  pingHex_ = hex;
+}
+
+void PoolSession::dropAssignment() {
+  {
+    std::lock_guard<std::mutex> lock(stateMu_);
+    state_.assignment.reset();
+    state_.save(statePath_);
+  }
+  setPingHex({});
+  resumedAssignment_ = false;
+}
+
+std::string PoolSession::keyChannels() const {
+  std::vector<std::string> c;
+  if (opts_.config.telegramShare) c.push_back("telegram_share");
+  if (opts_.config.apiShare) c.push_back("api_share");
+  return joined(c, " and ");
 }
 
 std::string PoolSession::chooseBackend(std::vector<std::string>* names) {
@@ -151,6 +178,16 @@ void PoolSession::setup() {
                           (rsaKey_ ? " (RSA " + std::to_string(rsaKey_->modulusBytes() * 8) + "-bit)" : "") +
                           ", telegram " + (cfg.telegramShare ? "on" : "off") + ", api share " +
                           (cfg.apiShare ? "on" : "off") + ", save key " + (cfg.saveKey ? "on" : "off"));
+  if (cfg.untrustedComputer && cfg.apiShare && lower(cfg.apiShareUrl).rfind("http://", 0) == 0) {
+    log(LogLevel::Warn, std::string("api_share_url uses plain http:// on an untrusted computer; ") +
+                            (rsaKey_ ? "notifications are sent without TLS"
+                                     : "a found key would be sent in plaintext over the network") +
+                            " (use https://)");
+  }
+  if (cfg.untrustedComputer && !rsaKey_) {
+    log(LogLevel::Info, "untrusted computer without public_key: a found target key is delivered via " + keyChannels() +
+                            " only and is not stored or printed locally");
+  }
   if (state_.rangesSubmitted) {
     log(LogLevel::Info, std::to_string(state_.rangesSubmitted) + " ranges submitted so far from this state directory");
   }
@@ -159,6 +196,8 @@ void PoolSession::setup() {
     log(LogLevel::Info, "resuming range " + display(a.range.hex) + " assigned " + a.assignedAt + " (" +
                             std::to_string(a.proofKeys.size()) + "/" + std::to_string(a.range.proofAddresses.size()) +
                             " proof keys found" + (a.scanComplete ? ", scan complete" : "") + ")");
+    setPingHex(a.range.hex);
+    resumedAssignment_ = true;
   }
 }
 
@@ -181,8 +220,15 @@ int PoolSession::run() {
         haveAssignment = state_.assignment.has_value();
         scanned = haveAssignment && state_.assignment->scanComplete;
       }
-      if (!haveAssignment && !fetchAssignment()) break;
-      if (!scanned && !scanAssignment()) break;
+      // One step per iteration: each step may drop the assignment (rejected/unscannable range).
+      if (!haveAssignment) {
+        if (!fetchAssignment()) break;
+        continue;
+      }
+      if (!scanned) {
+        if (!scanAssignment()) break;
+        continue;
+      }
       if (!submitAssignment()) break;
       if (opts_.maxRanges && submittedThisRun_ >= *opts_.maxRanges) {
         log(LogLevel::Info, "submitted " + std::to_string(submittedThisRun_) + " range(s); stopping as requested");
@@ -214,6 +260,8 @@ bool PoolSession::fetchAssignment() {
         state_.assignment = a;
         state_.save(statePath_);
       }
+      setPingHex(r.hex);
+      resumedAssignment_ = false;
       char bits[32];
       std::snprintf(bits, sizeof(bits), "2^%.2f", std::log2((r.end() - r.start() + 1).toDouble()));
       log(LogLevel::Info, "assigned range " + display(r.hex) + " (" + std::to_string(r.proofAddresses.size()) +
@@ -233,10 +281,6 @@ bool PoolSession::scanAssignment() {
     std::lock_guard<std::mutex> lock(stateMu_);
     r = state_.assignment->range;
   }
-  {
-    std::lock_guard<std::mutex> lock(pingMu_);
-    pingHex_ = r.hex;
-  }
   JobSpec spec;
   spec.addresses = r.proofAddresses;
   spec.addresses.push_back(r.targetAddress);
@@ -251,7 +295,16 @@ bool PoolSession::scanAssignment() {
   spec.checkpoint = true;
   spec.stopOnFound = false;  // the whole range must be covered to find every proof key (and the target)
 
-  manager_.start(spec);
+  try {
+    manager_.start(spec);
+  } catch (const JobError& ex) {
+    // A freshly fetched range passed parseRangeResponse, so a rejection is a local configuration problem.
+    if (!resumedAssignment_) throw;
+    log(LogLevel::Error, "saved range " + display(r.hex) + " cannot be scanned (" + ex.what() +
+                             "); dropping it and fetching a new range");
+    dropAssignment();
+    return true;
+  }
   if (stop_) {
     try {
       manager_.stop();
@@ -298,10 +351,13 @@ bool PoolSession::submitAssignment() {
     return p;
   };
   if (keys.size() != r.proofAddresses.size()) {
+    // A backend miss or a server anomaly: rescanning cannot help, and keeping the assignment would wedge the client.
     auto p = writeReport("incomplete");
-    throw std::runtime_error("range " + display(r.hex) + " was scanned but only " + std::to_string(keys.size()) + "/" +
+    log(LogLevel::Error, "range " + display(r.hex) + " was scanned but only " + std::to_string(keys.size()) + "/" +
                              std::to_string(r.proofAddresses.size()) + " proof keys were found (details: " +
-                             p.string() + ")");
+                             p.string() + "); dropping it and fetching a new range");
+    dropAssignment();
+    return true;
   }
 
   const std::string proof = hashedProofKey(keys);
@@ -314,9 +370,7 @@ bool PoolSession::submitAssignment() {
         auto p = writeReport("rejected");
         log(LogLevel::Error, "pool rejected range " + display(r.hex) + ": " + ex.what() + " (details: " + p.string() +
                                  "); fetching a new range");
-        std::lock_guard<std::mutex> lock(stateMu_);
-        state_.assignment.reset();
-        state_.save(statePath_);
+        dropAssignment();
         return true;
       }
       log(LogLevel::Warn, std::string(ex.what()) + "; retrying in " + std::to_string(opts_.retryDelay.count()) + " s");
@@ -333,10 +387,8 @@ bool PoolSession::submitAssignment() {
     state_.save(statePath_);
     total = state_.rangesSubmitted;
   }
-  {
-    std::lock_guard<std::mutex> lock(pingMu_);
-    pingHex_.clear();
-  }
+  setPingHex({});
+  resumedAssignment_ = false;
   submittedThisRun_++;
   log(LogLevel::Info, "range " + display(r.hex) + " submitted (" + std::to_string(total) + " total)");
   const std::string msg = "\u2705 " + r.hex + " scanned by " + state_.workerName + " (" + shortHash(api_->securityHash()) + ")";
@@ -365,24 +417,32 @@ void PoolSession::onFound(const FoundKey& key) {
 }
 
 void PoolSession::recordTarget(const FoundKey& key, const std::string& hex) {
+  const PoolConfig& cfg = opts_.config;
   std::string secret = upper(key.privkey);
   bool encrypted = false;
-  if (opts_.config.untrustedComputer && rsaKey_) {
+  if (cfg.untrustedComputer && rsaKey_) {
     secret = rsaOaepEncryptBase64(*rsaKey_, secret);
     encrypted = true;
   }
-  FoundKey rec = key;
-  if (encrypted) {
-    rec.privkey = "rsa-oaep:" + secret;
-    rec.wif.clear();
+  const std::string found = "TARGET KEY FOUND puzzle #" + std::to_string(cfg.targetPuzzle) + " address " + key.address;
+  if (cfg.untrustedComputer && !encrypted) {
+    // No public_key: like the official client, the plaintext key leaves only through the notification channels;
+    // nothing is written to disk or the console of a computer declared untrusted.
+    consoleOut(found + "; key delivered via " + keyChannels() + " only");
+  } else {
+    FoundKey rec = key;
+    if (encrypted) {
+      rec.privkey = "rsa-oaep:" + secret;
+      rec.wif.clear();
+    }
+    try {
+      appendResult(manager_.options().resultsPath, rec);
+    } catch (const std::exception& ex) {
+      log(LogLevel::Error, ex.what());
+    }
+    consoleOut(found +
+               (encrypted ? " privkey (RSA-encrypted) " + secret : " privkey " + key.privkey + " WIF " + key.wif));
   }
-  try {
-    appendResult(manager_.options().resultsPath, rec);
-  } catch (const std::exception& ex) {
-    log(LogLevel::Error, ex.what());
-  }
-  consoleOut("TARGET KEY FOUND puzzle #" + std::to_string(opts_.config.targetPuzzle) + " address " + key.address +
-             (encrypted ? " privkey (RSA-encrypted) " + secret : " privkey " + key.privkey + " WIF " + key.wif));
   std::lock_guard<std::mutex> lock(notifyMu_);
   notifications_.push_back(Notification{key.address, secret, hex, encrypted});
   notifyCv_.notify_all();
@@ -423,7 +483,9 @@ void PoolSession::notifierLoop() {
       }
       lock.lock();
       bool done = notifierDone_;
-      if (done && attempt >= 3) {
+      // Without a local copy (untrusted computer, no public_key) delivery is retried until it succeeds.
+      const bool localCopy = n.encrypted || !cfg.untrustedComputer;
+      if (done && attempt >= 3 && localCopy) {
         lock.unlock();
         log(LogLevel::Error, "could not deliver the found key notification; it is in the results file " +
                                  manager_.options().resultsPath.string());

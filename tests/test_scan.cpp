@@ -1,18 +1,22 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <thread>
 
 #include "catalog/catalog.h"
 #include "core/address.h"
+#include "core/base58.h"
 #include "core/gtable.h"
 #include "core/random.h"
 #include "core/ripemd160.h"
 #include "engine/bytes.h"
 #include "engine/checkpoint.h"
 #include "engine/job_manager.h"
+#include "engine/run_context.h"
 
 using namespace bsolver;
 namespace fs = std::filesystem;
@@ -88,6 +92,48 @@ TEST_CASE("uncompressed address mode") {
   JobStatus st = runToEnd(m, s);
   REQUIRE(st.outcome == Outcome::Found);
   CHECK(st.found[0].privkey.ends_with("10e1"));  // 4321
+  // The WIF must import as the uncompressed key: 0x80 || key, no 0x01 suffix.
+  auto wif = base58Decode(st.found[0].wif);
+  REQUIRE(wif);
+  REQUIRE(wif->size() == 1 + 32 + 4);
+  CHECK((*wif)[0] == 0x80);
+  uint8_t key[32];
+  U256::fromU64(4321).toBytesBE(key);
+  CHECK(std::equal(key, key + 32, wif->begin() + 1));
+}
+
+TEST_CASE("corrupt checkpoint payload fails with a hint") {
+  TempDir dir;
+  JobSpec s = cpuScan();
+  s.checkpoint = true;
+  s.puzzle = 24;
+  const ManagerOptions opts{dir.path / "state", dir.path / "found.jsonl"};
+  const ResolvedJob resolved = resolve(s, catalog());
+  Checkpointer c(opts.stateDir, Algo::Scan, resolved.identity, true, false);
+  c.setSnapshot([] { return std::vector<uint8_t>{1, 2, 3}; });  // header ok, payload truncated
+  c.saveNow();
+
+  JobManager m(catalog(), opts);
+  JobStatus st = runToEnd(m, s);
+  CHECK(st.outcome == Outcome::Error);
+  CHECK(st.error == "checkpoint " + c.path().string() + " is corrupt (use --fresh)");
+}
+
+TEST_CASE("runThreads stops the others and rethrows the first failure") {
+  JobSpec spec;
+  ResolvedJob job;
+  Checkpointer ckpt(fs::temp_directory_path(), Algo::Scan, "runThreads test", false, false);
+  RunContext ctx(job, spec, ckpt, [](LogLevel, const std::string&) {}, [](const FoundKey&) {});
+  std::atomic<int> finished{0};
+  CHECK_THROWS_WITH(runThreads(ctx, 4,
+                               [&](size_t i) {
+                                 if (i == 2) throw std::runtime_error("boom");
+                                 while (!ctx.stopRequested()) std::this_thread::yield();
+                                 ++finished;
+                               }),
+                    "boom");
+  CHECK(ctx.stopRequested());
+  CHECK(finished == 3);
 }
 
 TEST_CASE("scan exhausts a range without the key") {

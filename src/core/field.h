@@ -16,8 +16,6 @@ struct Fe {
   // Reduces values >= p.
   static Fe fromU256(const U256& v);
   U256 toU256() const { return U256{{n[0], n[1], n[2], n[3]}}; }
-  // Big-endian 32 bytes; reduces values >= p.
-  static Fe fromBytesBE(const uint8_t* in32) { return fromU256(U256::fromBytesBE(in32)); }
   void toBytesBE(uint8_t* out32) const { toU256().toBytesBE(out32); }
 
   bool isZero() const { return (n[0] | n[1] | n[2] | n[3]) == 0; }

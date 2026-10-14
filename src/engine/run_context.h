@@ -89,4 +89,8 @@ class RunContext {
   std::atomic<size_t> foundCount_{0};
 };
 
+// Runs body(i) for i in [0, n) on n threads and joins them all. If a thread cannot be started or a body throws,
+// requests a stop so the other bodies wind down, joins every started thread and rethrows the first exception.
+void runThreads(RunContext& ctx, size_t n, const std::function<void(size_t)>& body);
+
 }  // namespace bsolver

@@ -7,6 +7,8 @@
 #include <cctype>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <mutex>
 #include <thread>
 
@@ -14,6 +16,7 @@
 #include "core/address.h"
 #include "core/gtable.h"
 #include "core/random.h"
+#include "core/scalar.h"
 #include "engine/job_manager.h"
 #include "pool/http_client.h"
 #include "pool/pool_api.h"
@@ -98,6 +101,32 @@ TEST_CASE("pool range response parsing (API documentation example)") {
                   PoolError);
 }
 
+TEST_CASE("pool range responses outside the key space are rejected") {
+  auto body = [](const std::string& hex, const std::string& start, const std::string& end) {
+    return json{{"hex", hex},
+                {"workloadStart", start},
+                {"workloadEnd", end},
+                {"targetAddress", "1MVDYgVaSN6iKKEsbzRUAYFrYJadLYZvvZ"},
+                {"proofOfWorkAddresses", {"1QLLeQ3Hwp9ai7L4KM65e7SxS12skkYUsA"}}}
+        .dump();
+  };
+  auto rejected = [](const std::string& b) {
+    try {
+      parseRangeResponse(b);
+      return false;
+    } catch (const PoolError& ex) {
+      return !ex.retryable();
+    }
+  };
+  const std::string nHigh = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8C";  // n = nHigh || D0364141
+  CHECK(rejected(body("0", "0000", "FFFF")));                                    // starts at key 0
+  CHECK(rejected(body("1", std::string(63, '0'), std::string(64, 'F'))));        // end wraps past 2^256
+  CHECK(rejected(body(nHigh, "00000000", "D0364141")));                          // end == n
+  CHECK(rejected(body(std::string(56, 'F'), "00000000", "1")));                  // start > n
+  CHECK(parseRangeResponse(body(nHigh, "00000000", "D0364140")).end() == kOrderN - 1);  // end == n - 1 is fine
+  CHECK(parseRangeResponse(body("0", "0000", "FFFF"), false).start().isZero());  // saved state: structure only
+}
+
 namespace {
 std::string upperHex64(const U256& k) {
   std::string s = k.toHex(true);
@@ -115,6 +144,9 @@ struct MockPool {
   U256 targetKey;
   std::mutex mu;
   int gets = 0, pings = 0;
+  int unfindableGets = 0;         // the next N ranges carry an extra proof address whose key lies outside the range
+  int failPuts = 0;               // the next N submissions answer 503
+  int pingsDuringFailedPuts = 0;  // pings seen when the last failing submission arrived
   std::vector<httplib::Headers> puts;
   std::vector<std::string> webhookStatuses;
   httplib::Headers keyFound;
@@ -135,19 +167,21 @@ struct MockPool {
                         "application/problem+json");
         return;
       }
-      json addrs = json::array();
-      for (const auto& k : proofKeys) addrs.push_back(address(k));
-      res.set_content(json{{"hex", hex},
-                           {"puzzleCode", 38},
-                           {"workloadStart", workloadStart},
-                           {"workloadEnd", workloadEnd},
-                           {"targetAddress", address(targetKey)},
-                           {"proofOfWorkAddresses", addrs}}
-                          .dump(),
-                      "application/json");
+      json r = rangeJson();
+      if (unfindableGets > 0) {
+        --unfindableGets;
+        r["proofOfWorkAddresses"].push_back(address(U256::fromHex(hex + workloadStart) + (uint64_t{1} << 30)));
+      }
+      res.set_content(r.dump(), "application/json");
     });
     server.Put("/puzzle/38/range", [this](const httplib::Request& req, httplib::Response& res) {
       std::lock_guard<std::mutex> lock(mu);
+      if (failPuts > 0) {
+        --failPuts;
+        pingsDuringFailedPuts = pings;
+        res.status = 503;
+        return;
+      }
       puts.push_back(req.headers);
       res.set_content(R"({"isSuccess":true})", "application/json");
     });
@@ -169,6 +203,18 @@ struct MockPool {
   ~MockPool() {
     server.stop();
     thread.join();
+  }
+
+  // Caller holds mu (or the server is idle).
+  json rangeJson() const {
+    json addrs = json::array();
+    for (const auto& k : proofKeys) addrs.push_back(address(k));
+    return json{{"hex", hex},
+                {"puzzleCode", 38},
+                {"workloadStart", workloadStart},
+                {"workloadEnd", workloadEnd},
+                {"targetAddress", address(targetKey)},
+                {"proofOfWorkAddresses", addrs}};
   }
 
   std::string expectedProofHash() const {
@@ -263,6 +309,109 @@ TEST_CASE("pool session in untrusted mode never records the target key in plaint
   CHECK(results[0].privkey.rfind("rsa-oaep:", 0) == 0);
   CHECK(results[0].wif.empty());
   CHECK(results[0].privkey.find(plain) == std::string::npos);
+}
+
+TEST_CASE("pool session in untrusted mode without public_key keeps no local copy of the target key") {
+  if (!httpsSupported()) SKIP("built without an HTTP client");
+  MockPool mock("FFFF", {7, 1000}, 4321);
+  TempDir dir;
+  JobManager manager(catalog(), ManagerOptions{dir.path / "state", dir.path / "found.jsonl"});
+  PoolSessionOptions o = mock.options();
+  o.config.untrustedComputer = true;  // api_share is the delivery channel
+  REQUIRE(PoolSession(manager, o).run() == 0);
+
+  std::lock_guard<std::mutex> lock(mock.mu);
+  REQUIRE(mock.keyFound.count("PrivateKey"));
+  CHECK(mock.keyFound.find("PrivateKey")->second == upperHex64(mock.targetKey));
+  CHECK(mock.keyFound.find("Encrypted")->second == "false");
+  CHECK(readResults(dir.path / "found.jsonl").empty());
+  const std::string lowerKey = mock.targetKey.toHex(true), upperKey = upperHex64(mock.targetKey);
+  for (const auto& e : fs::recursive_directory_iterator(dir.path)) {
+    if (!e.is_regular_file()) continue;
+    std::ifstream in(e.path(), std::ios::binary);
+    std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    INFO(e.path().string());
+    CHECK(content.find(lowerKey) == std::string::npos);
+    CHECK(content.find(upperKey) == std::string::npos);
+  }
+}
+
+TEST_CASE("pool session drops a range with missing proof keys and fetches a new one") {
+  if (!httpsSupported()) SKIP("built without an HTTP client");
+  MockPool mock("FFFF", {7, 1000}, 4321);
+  mock.unfindableGets = 1;
+  TempDir dir;
+  JobManager manager(catalog(), ManagerOptions{dir.path / "state", dir.path / "found.jsonl"});
+  REQUIRE(PoolSession(manager, mock.options()).run() == 0);
+
+  std::lock_guard<std::mutex> lock(mock.mu);
+  CHECK(mock.gets == 2);
+  REQUIRE(mock.puts.size() == 1);
+  CHECK(mock.puts[0].find("HashedProofKey")->second == mock.expectedProofHash());
+  CHECK(fs::exists(dir.path / "state" / "pool-38-incomplete-200.txt"));
+  auto state = PoolState::load(poolStatePath(dir.path / "state", 38));
+  REQUIRE(state);
+  CHECK_FALSE(state->assignment);
+  CHECK(state->rangesSubmitted == 1);
+}
+
+TEST_CASE("pool session rejects an out-of-range assignment before persisting it") {
+  if (!httpsSupported()) SKIP("built without an HTTP client");
+  MockPool mock("FFFF", {7}, 4321);
+  mock.hex = "0";  // range starts at key 0
+  TempDir dir;
+  JobManager manager(catalog(), ManagerOptions{dir.path / "state", dir.path / "found.jsonl"});
+  CHECK(PoolSession(manager, mock.options()).run() == 1);
+  auto state = PoolState::load(poolStatePath(dir.path / "state", 38));
+  REQUIRE(state);
+  CHECK_FALSE(state->assignment);
+  std::lock_guard<std::mutex> lock(mock.mu);
+  CHECK(mock.gets == 1);
+}
+
+namespace {
+PoolState savedState(const PoolRange& range) {
+  PoolState s;
+  s.puzzle = 38;
+  s.tokenId = poolTokenId(std::string(128, 'a'));
+  s.workerName = "testrig";
+  s.assignment = PoolAssignment{range, {}, false, "2026-01-01T00:00:00Z"};
+  return s;
+}
+}  // namespace
+
+TEST_CASE("pool session drops a saved range the engine rejects") {
+  if (!httpsSupported()) SKIP("built without an HTTP client");
+  MockPool mock("FFFF", {7, 1000}, 4321);
+  TempDir dir;
+  json bad = mock.rangeJson();
+  bad["hex"] = "0";
+  savedState(parseRangeResponse(bad.dump(), false)).save(poolStatePath(dir.path / "state", 38));
+  JobManager manager(catalog(), ManagerOptions{dir.path / "state", dir.path / "found.jsonl"});
+  REQUIRE(PoolSession(manager, mock.options()).run() == 0);
+  std::lock_guard<std::mutex> lock(mock.mu);
+  CHECK(mock.gets == 1);
+  REQUIRE(mock.puts.size() == 1);
+  CHECK(mock.puts[0].find("HEX")->second == "200");
+}
+
+TEST_CASE("pool session pings a scanned range while its submission is retried") {
+  if (!httpsSupported()) SKIP("built without an HTTP client");
+  MockPool mock("FFFF", {7, 1000}, 4321);
+  mock.failPuts = 4;
+  TempDir dir;
+  PoolState s = savedState(parseRangeResponse(mock.rangeJson().dump()));
+  for (const auto& k : mock.proofKeys) s.assignment->proofKeys[MockPool::address(k)] = upperHex64(k);
+  s.assignment->scanComplete = true;
+  s.save(poolStatePath(dir.path / "state", 38));
+  JobManager manager(catalog(), ManagerOptions{dir.path / "state", dir.path / "found.jsonl"});
+  REQUIRE(PoolSession(manager, mock.options()).run() == 0);
+
+  std::lock_guard<std::mutex> lock(mock.mu);
+  CHECK(mock.gets == 0);
+  REQUIRE(mock.puts.size() == 1);
+  CHECK(mock.puts[0].find("HashedProofKey")->second == mock.expectedProofHash());
+  CHECK(mock.pingsDuringFailedPuts >= 1);
 }
 
 TEST_CASE("pool session resumes an interrupted range") {

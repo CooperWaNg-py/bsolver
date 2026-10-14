@@ -18,9 +18,11 @@ jobs:
         with:
           node-version: 22
 
-      - name: Install libcurl (pool client)
+      # libcurl for the pool client; OpenCL headers + ICD loader so the OpenCL backend is compiled
+      # on Linux too (no GPU on the runner, so its tests skip).
+      - name: Install Linux dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev ocl-icd-opencl-dev opencl-headers
 
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBSOLVER_CUDA=OFF

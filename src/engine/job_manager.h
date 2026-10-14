@@ -40,17 +40,18 @@ class JobManager {
   JobManager(const JobManager&) = delete;
   JobManager& operator=(const JobManager&) = delete;
 
-  // Throws JobError (invalid spec) or ConflictError("a job is already active").
+  // Throws JobError (invalid spec) or ConflictError("a job is already active" / "a benchmark is running")
+  // without waiting for a running benchmark.
   JobStatus start(const JobSpec& spec);
   // Throw ConflictError: "no active job" / "job is not running" / "job is not paused".
   JobStatus stop();
   JobStatus pause();
   JobStatus resume();
   JobStatus status() const;
-  // Blocking; throws ConflictError("a job is already active") while a job is active.
+  // Blocking; throws ConflictError immediately while a job or another benchmark is active.
   std::vector<BenchResult> bench(Algo algo, double seconds, unsigned threads = 0);
 
-  // Callbacks run on manager threads and must not call subscribe/unsubscribe.
+  // Callbacks run on manager threads and must not call subscribe/unsubscribe. Exceptions they throw are swallowed.
   int subscribe(std::function<void(const Event&)> fn);
   void unsubscribe(int id);
   // Blocks until no job is active.
@@ -72,6 +73,7 @@ class JobManager {
   void onFound(const FoundKey& key);
   void publish(const Event& e);
   JobStatus statusLocked() const;
+  void throwIfBusyLocked() const;  // ConflictError when a job is active/starting or a benchmark runs
   void joinThreads();
 
   const Catalog& catalog_;
@@ -82,7 +84,8 @@ class JobManager {
   JobStatus st_;
   std::shared_ptr<ActiveJob> job_;
   std::thread jobThread_, tickThread_;
-  std::mutex controlMu_;  // serializes start()/bench() (thread joins happen outside mu_)
+  // start() and bench() claim these under mu_ and fail fast on conflict; thread joins happen outside mu_.
+  bool starting_ = false;
   bool benchRunning_ = false;
   std::mutex resultsMu_;
   std::function<void(const FoundKey&)> foundHandler_;  // guarded by resultsMu_

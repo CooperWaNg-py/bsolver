@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <filesystem>
+#include <stdexcept>
 #include <thread>
 
 #include "catalog/catalog.h"
@@ -120,4 +121,89 @@ TEST_CASE("event stream sends status first and accepts the query token") {
   auto denied = f.client.Get("/api/events?token=nope");
   REQUIRE(denied);
   CHECK(denied->status == 401);
+}
+
+TEST_CASE("a throwing subscriber does not take down the manager") {
+  Fixture f;
+  f.manager.subscribe([](const Event&) { throw std::runtime_error("subscriber failure"); });
+  JobSpec spec;
+  spec.puzzle = 20;  // solved: start() also publishes a warning log
+  spec.backend = "cpu";
+  spec.checkpoint = false;
+  REQUIRE_NOTHROW(f.manager.start(spec));
+  f.manager.wait();
+  JobStatus s = f.manager.status();
+  CHECK(s.state == JobState::Finished);
+  CHECK(s.found.size() == 1);
+}
+
+TEST_CASE("event stream replaces invalid UTF-8 in log text") {
+  Fixture f;
+  f.client.set_read_timeout(std::chrono::seconds(5));
+  const std::string expected = "bad byte \xEF\xBF\xBD here";  // U+FFFD replaces the invalid 0xFF
+  std::string received;
+  bool logged = false;
+  f.client.Get("/api/events?token=t", [&](const char* data, size_t len) {
+    received.append(data, len);
+    if (!logged && received.find("\n\n") != std::string::npos) {  // subscribed once the first frame arrived
+      logged = true;
+      f.manager.log(LogLevel::Warn, "bad byte \xff here");
+    }
+    return received.find(expected) == std::string::npos;
+  });
+  CHECK(received.find("event: log\ndata: ") != std::string::npos);
+  CHECK(received.find(expected) != std::string::npos);
+}
+
+TEST_CASE("job start and benchmarks fail fast while a benchmark runs") {
+  Fixture f;
+  httplib::Client benchClient{"127.0.0.1", f.port};
+  benchClient.set_read_timeout(std::chrono::seconds(120));
+  int benchStatus = 0;
+  std::thread bench([&] {
+    auto r = benchClient.Post("/api/bench", f.auth, R"({"algorithm":"scan","seconds":2})", "application/json");
+    if (r) benchStatus = r->status;
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+  auto t0 = std::chrono::steady_clock::now();
+  const char* job = R"({"puzzle":20,"backend":"cpu","checkpoint":false})";
+  auto r = f.client.Post("/api/job", f.auth, job, "application/json");
+  auto r2 = f.client.Post("/api/bench", f.auth, R"({"seconds":1})", "application/json");
+  auto elapsed = std::chrono::steady_clock::now() - t0;
+  bench.join();
+
+  REQUIRE(r);
+  CHECK(r->status == 409);
+  CHECK(json::parse(r->body)["error"] == "a benchmark is running");
+  REQUIRE(r2);
+  CHECK(r2->status == 409);
+  CHECK(json::parse(r2->body)["error"] == "a benchmark is running");
+  CHECK(elapsed < std::chrono::seconds(1));
+  CHECK(benchStatus == 200);
+
+  auto after = f.client.Post("/api/job", f.auth, job, "application/json");
+  REQUIRE(after);
+  CHECK(after->status == 202);
+}
+
+TEST_CASE("SSE queue keeps the newest status and never evicts pinned frames") {
+  SseQueue q(4);
+  q.push("status", "S1;", false);
+  q.push("found", "F;", true);
+  q.push("status", "S2;", false);
+  CHECK(q.size() == 2);
+  for (int i = 0; i < 10; ++i) q.push("log", "L" + std::to_string(i) + ";", false);
+  q.push("log", "E;", true);
+  q.push("status", "S3;", false);
+  // Oldest unpinned frames were evicted; the found and error frames survived and only the newest status remains.
+  CHECK(q.drain() == "F;L9;E;S3;");
+  CHECK(q.empty());
+
+  SseQueue full(2);
+  full.push("found", "F1;", true);
+  full.push("log", "E1;", true);
+  full.push("log", "I;", false);  // dropped: nothing unpinned to evict
+  full.push("found", "F2;", true);
+  CHECK(full.drain() == "F1;E1;F2;");
 }

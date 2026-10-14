@@ -2,9 +2,9 @@
 
 #include <httplib.h>
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
-#include <deque>
 #include <stdexcept>
 
 #include "assets/assets.h"
@@ -17,9 +17,13 @@ namespace bsolver {
 namespace {
 using nlohmann::json;
 
+// Text from logs, paths and exception messages may not be valid UTF-8 (e.g. Windows code-page paths); replace
+// invalid bytes instead of throwing.
+std::string dumpJson(const json& j) { return j.dump(-1, ' ', false, json::error_handler_t::replace); }
+
 void sendJson(httplib::Response& res, int status, const json& body) {
   res.status = status;
-  res.set_content(body.dump(), "application/json");
+  res.set_content(dumpJson(body), "application/json");
 }
 
 void sendError(httplib::Response& res, int status, const std::string& msg) {
@@ -38,7 +42,7 @@ bool constantTimeEqual(std::string_view a, std::string_view b) {
 }
 
 std::string sseFrame(const std::string& type, const json& payload) {
-  return "event: " + type + "\ndata: " + payload.dump() + "\n\n";
+  return "event: " + type + "\ndata: " + dumpJson(payload) + "\n\n";
 }
 
 const assets::Asset* findAsset(std::string_view path) {
@@ -70,17 +74,44 @@ bool isLoopbackHost(const std::string& host) {
   return host == "localhost" || host == "::1" || host == "[::1]" || host.rfind("127.", 0) == 0;
 }
 
+void SseQueue::push(const std::string& type, std::string frame, bool pinned) {
+  if (type == "status") {
+    // Status frames are snapshots: only the newest pending one is worth sending.
+    auto old = std::find_if(frames_.begin(), frames_.end(), [](const Frame& f) { return f.type == "status"; });
+    if (old != frames_.end()) frames_.erase(old);
+  }
+  if (frames_.size() >= limit_) {
+    auto victim = std::find_if(frames_.begin(), frames_.end(), [](const Frame& f) { return !f.pinned; });
+    if (victim != frames_.end()) {
+      frames_.erase(victim);
+    } else if (!pinned) {
+      return;  // full of pinned frames: drop the new unpinned one
+    }
+    // Otherwise every pending frame is pinned and so is the new one: grow past the limit rather than lose it.
+  }
+  frames_.push_back(Frame{type, std::move(frame), pinned});
+}
+
+std::string SseQueue::drain() {
+  std::string out;
+  for (const auto& f : frames_) out += f.data;
+  frames_.clear();
+  return out;
+}
+
 struct HttpServer::EventClient {
   std::mutex mu;
   std::condition_variable cv;
-  std::deque<std::string> queue;
+  SseQueue queue{kEventQueueLimit};
   bool closed = false;
   int subscription = 0;
 
-  void push(std::string frame) {
+  void push(const std::string& type, const json& payload) {
+    const bool pinned =
+        type == "found" || (type == "log" && payload.is_object() && payload.value("level", "") == "error");
+    std::string frame = sseFrame(type, payload);
     std::lock_guard<std::mutex> lock(mu);
-    if (queue.size() >= kEventQueueLimit) queue.pop_front();
-    queue.push_back(std::move(frame));
+    queue.push(type, std::move(frame), pinned);
     cv.notify_one();
   }
   void close() {
@@ -218,8 +249,8 @@ void HttpServer::setupRoutes() {
       return sendError(res, 503, "too many event streams");
     }
     auto client = std::make_shared<EventClient>();
-    client->push(sseFrame("status", json(manager_.status())));
-    client->subscription = manager_.subscribe([client](const Event& e) { client->push(sseFrame(e.type, e.payload)); });
+    client->push("status", json(manager_.status()));
+    client->subscription = manager_.subscribe([client](const Event& e) { client->push(e.type, e.payload); });
     {
       std::lock_guard<std::mutex> lock(clientsMu_);
       clients_.insert(client);
@@ -234,14 +265,7 @@ void HttpServer::setupRoutes() {
             std::unique_lock<std::mutex> lock(client->mu);
             client->cv.wait_for(lock, std::chrono::seconds(15), [&] { return !client->queue.empty() || client->closed; });
             if (client->closed) return false;
-            if (client->queue.empty()) {
-              out = ": ping\n\n";
-            } else {
-              while (!client->queue.empty()) {
-                out += client->queue.front();
-                client->queue.pop_front();
-              }
-            }
+            out = client->queue.empty() ? std::string(": ping\n\n") : client->queue.drain();
           }
           return sink.write(out.data(), out.size());
         },

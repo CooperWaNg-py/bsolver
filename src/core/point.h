@@ -31,13 +31,10 @@ Jacobian toJacobian(const Affine& a);
 Jacobian jacDouble(const Jacobian& p);
 // p + q with q affine; handles p == q (double) and p == -q (infinity).
 Jacobian jacAddMixed(const Jacobian& p, const Affine& q);
-// General p + q.
-Jacobian jacAdd(const Jacobian& p, const Jacobian& q);
 Affine toAffine(const Jacobian& p);
 // One batch inversion for all points; infinity stays infinity.
 void batchToAffine(const Jacobian* in, Affine* out, size_t n);
 
-Affine negate(const Affine& a);
 Affine add(const Affine& a, const Affine& b);
 bool isOnCurve(const Affine& a);
 

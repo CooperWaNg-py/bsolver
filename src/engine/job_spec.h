@@ -55,6 +55,14 @@ struct ResolvedJob {
   U256 width() const { return rangeEnd - rangeStart + 1; }
 };
 
+// Limits enforced by resolve().
+constexpr unsigned kMaxThreads = 1024;
+constexpr uint32_t kMaxDpBits = 60;
+// BSGS table limit: the largest power of two not above half the physical memory, in MiB (fallback when the
+// physical memory cannot be determined).
+constexpr uint32_t kFallbackMaxBsgsMemoryMb = 65536;
+uint32_t maxBsgsMemoryMb();
+
 // Validates the spec against the catalog. Throws JobError.
 ResolvedJob resolve(const JobSpec& spec, const Catalog& catalog);
 

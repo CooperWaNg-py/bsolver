@@ -14,12 +14,8 @@ namespace bsolver {
 class ByteWriter {
  public:
   void u8(uint8_t v) { buf_.push_back(v); }
-  void u32(uint32_t v) {
-    for (int i = 0; i < 4; ++i) buf_.push_back(static_cast<uint8_t>(v >> (8 * i)));
-  }
-  void u64(uint64_t v) {
-    for (int i = 0; i < 8; ++i) buf_.push_back(static_cast<uint8_t>(v >> (8 * i)));
-  }
+  void u32(uint32_t v) { le(v, 4); }
+  void u64(uint64_t v) { le(v, 8); }
   void u256(const U256& v) {
     for (uint64_t w : v.w) u64(w);
   }
@@ -27,9 +23,20 @@ class ByteWriter {
     const auto* b = static_cast<const uint8_t*>(p);
     buf_.insert(buf_.end(), b, b + n);
   }
+  void reserve(size_t n) { buf_.reserve(n); }
+  size_t size() const { return buf_.size(); }
+  // Overwrites 8 bytes at pos (written earlier, e.g. a count placeholder).
+  void patchU64(size_t pos, uint64_t v) {
+    for (int i = 0; i < 8; ++i) buf_.at(pos + i) = static_cast<uint8_t>(v >> (8 * i));
+  }
   std::vector<uint8_t>& data() { return buf_; }
 
  private:
+  void le(uint64_t v, int n) {
+    uint8_t b[8];
+    for (int i = 0; i < n; ++i) b[i] = static_cast<uint8_t>(v >> (8 * i));
+    buf_.insert(buf_.end(), b, b + n);
+  }
   std::vector<uint8_t> buf_;
 };
 

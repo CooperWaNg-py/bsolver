@@ -63,9 +63,11 @@ class PointEnumerator {
   }
 
  private:
-  // Returns false (without emitting) when some dx is zero; C advances to the next center on success.
+  // Returns false (without emitting) when C is infinity (s + GROUP/2 == n) or some dx is zero; C advances to the
+  // next center on success.
   template <class Fn>
   bool groupFast(Affine& C, uint64_t base, uint64_t n, Fn& fn) {
+    if (C.inf) return false;
     const auto& ig = tables_.ig;
     for (size_t i = 0; i < H; ++i) {
       dx_[i] = feSub(ig[i].x, C.x);

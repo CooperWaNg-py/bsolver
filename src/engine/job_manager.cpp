@@ -82,11 +82,18 @@ void JobManager::joinThreads() {
 }
 
 JobStatus JobManager::start(const JobSpec& spec) {
-  std::lock_guard<std::mutex> control(controlMu_);
   {
     std::lock_guard<std::mutex> lock(mu_);
-    if (benchRunning_ || (job_ && isActive(st_.state))) throw ConflictError("a job is already active");
+    throwIfBusyLocked();
+    starting_ = true;
   }
+  struct StartGuard {
+    JobManager* m;
+    ~StartGuard() {
+      std::lock_guard<std::mutex> lock(m->mu_);
+      m->starting_ = false;
+    }
+  } guard{this};
   ResolvedJob resolved = resolve(spec, catalog_);
   validateBackend(spec, resolved.algorithm);
   joinThreads();
@@ -316,11 +323,15 @@ JobStatus JobManager::statusLocked() const {
   return s;
 }
 
+void JobManager::throwIfBusyLocked() const {
+  if (benchRunning_) throw ConflictError("a benchmark is running");
+  if (starting_ || (job_ && isActive(st_.state))) throw ConflictError("a job is already active");
+}
+
 std::vector<BenchResult> JobManager::bench(Algo algo, double seconds, unsigned threads) {
-  std::lock_guard<std::mutex> control(controlMu_);
   {
     std::lock_guard<std::mutex> lock(mu_);
-    if (job_ && isActive(st_.state)) throw ConflictError("a job is already active");
+    throwIfBusyLocked();
     benchRunning_ = true;
   }
   struct Reset {
@@ -347,7 +358,13 @@ void JobManager::unsubscribe(int id) {
 
 void JobManager::publish(const Event& e) {
   std::lock_guard<std::mutex> lock(subMu_);
-  for (auto& [id, fn] : subs_) fn(e);
+  for (auto& [id, fn] : subs_) {
+    // A failing subscriber must not take down the manager thread (or the whole process) that published.
+    try {
+      fn(e);
+    } catch (...) {
+    }
+  }
 }
 
 void JobManager::wait() {

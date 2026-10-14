@@ -64,32 +64,6 @@ Jacobian jacAddMixed(const Jacobian& p, const Affine& q) {
   return o;
 }
 
-Jacobian jacAdd(const Jacobian& p, const Jacobian& q) {
-  if (q.inf) return p;
-  if (p.inf) return q;
-  Fe z1z1 = feSqr(p.z);
-  Fe z2z2 = feSqr(q.z);
-  Fe u1 = feMul(p.x, z2z2);
-  Fe u2 = feMul(q.x, z1z1);
-  Fe s1 = feMul(feMul(p.y, q.z), z2z2);
-  Fe s2 = feMul(feMul(q.y, p.z), z1z1);
-  Fe h = feSub(u2, u1);
-  Fe r = feSub(s2, s1);
-  if (h.isZero()) {
-    if (r.isZero()) return jacDouble(p);
-    return Jacobian{};
-  }
-  Fe hh = feSqr(h);
-  Fe hhh = feMul(h, hh);
-  Fe v = feMul(u1, hh);
-  Jacobian o;
-  o.inf = false;
-  o.x = feSub(feSub(feSqr(r), hhh), feAdd(v, v));
-  o.y = feSub(feMul(r, feSub(v, o.x)), feMul(s1, hhh));
-  o.z = feMul(feMul(p.z, q.z), h);
-  return o;
-}
-
 Affine toAffine(const Jacobian& p) {
   if (p.inf) return Affine{};
   Fe zi = feInv(p.z);
@@ -109,11 +83,6 @@ void batchToAffine(const Jacobian* in, Affine* out, size_t n) {
     Fe zi2 = feSqr(z[i]);
     out[i] = Affine{feMul(in[i].x, zi2), feMul(feMul(in[i].y, zi2), z[i]), false};
   }
-}
-
-Affine negate(const Affine& a) {
-  if (a.inf) return a;
-  return Affine{a.x, feNeg(a.y), false};
 }
 
 Affine add(const Affine& a, const Affine& b) { return toAffine(jacAddMixed(toJacobian(a), b)); }

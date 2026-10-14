@@ -14,6 +14,7 @@
 #include "core/point_enum.h"
 #include "core/random.h"
 #include "core/ripemd160.h"
+#include "core/scalar.h"
 #include "core/sha256.h"
 
 using namespace bsolver;
@@ -52,6 +53,7 @@ TEST_CASE("hash160 fast paths match streaming implementations") {
 
 TEST_CASE("WIF of key 1") {
   CHECK(wifCompressed(U256::fromU64(1)) == "KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU73sVHnoWn");
+  CHECK(wifUncompressed(U256::fromU64(1)) == "5HpHagT65TZzG1PH3CSu63k8DbpvD8s5ip4nEB3kEsreAnchuDf");
 }
 
 TEST_CASE("U256 hex parsing") {
@@ -116,6 +118,8 @@ TEST_CASE("PointEnumerator matches mulG") {
   };
   check(U256::fromU64(1), 5000);
   check(U256::fromU64((uint64_t{1} << 40) - 100), 3101);
+  // Range ending at n-1 whose last group's center is n (the point at infinity).
+  check(kOrderN - U256::fromU64(2560), 2560);
 }
 
 TEST_CASE("progression matches mulG") {

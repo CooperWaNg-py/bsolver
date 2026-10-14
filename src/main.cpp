@@ -35,12 +35,18 @@ namespace {
 
 volatile std::sig_atomic_t gSignal = 0;
 volatile std::sig_atomic_t gSignalCount = 0;
+volatile std::sig_atomic_t gExitOnSecondSignal = 0;
 extern "C" void onSignal(int sig) {
   gSignal = sig;
   gSignalCount = gSignalCount + 1;
+  // std::_Exit is signal-safe; exiting from the handler also covers blocking phases (benchmark, joins, server stop).
+  if (gExitOnSecondSignal && gSignalCount >= 2) std::_Exit(130);
 }
 
-void installSignalHandlers() {
+// exitOnSecond: a second SIGINT/SIGTERM terminates immediately with status 130. Callers that poll gSignalCount
+// themselves (pool) pass false.
+void installSignalHandlers(bool exitOnSecond) {
+  gExitOnSecondSignal = exitOnSecond ? 1 : 0;
   std::signal(SIGINT, onSignal);
   std::signal(SIGTERM, onSignal);
 }
@@ -228,9 +234,9 @@ int cmdServe(const std::string& listen, const std::string& token, const std::str
   Catalog catalog = loadCatalog(catalogPath);
   JobManager manager(catalog, ManagerOptions{stateDir, results});
   auto server = startWeb(manager, catalog, listen, token);
-  installSignalHandlers();
+  installSignalHandlers(true);
   while (!gSignal) std::this_thread::sleep_for(std::chrono::milliseconds(100));
-  consoleLog("[info] shutting down");
+  consoleLog("[info] shutting down; stopping the job and writing checkpoint (Ctrl-C again to quit now)");
   try {
     manager.stop();
   } catch (const ConflictError&) {
@@ -246,7 +252,7 @@ int cmdRun(const RunOptions& o) {
   JobSpec spec = buildSpec(o);
   std::unique_ptr<HttpServer> server;
   if (o.web) server = startWeb(manager, catalog, *o.web, o.token);
-  installSignalHandlers();
+  installSignalHandlers(true);
   try {
     manager.start(spec);
   } catch (const JobError& ex) {
@@ -260,7 +266,7 @@ int cmdRun(const RunOptions& o) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     if (gSignal && !interrupted) {
       interrupted = true;
-      consoleLog("[info] interrupted; stopping and writing checkpoint");
+      consoleLog("[info] interrupted; stopping and writing checkpoint (Ctrl-C again to quit now)");
       try {
         manager.stop();
       } catch (const ConflictError&) {
@@ -355,7 +361,7 @@ int cmdPool(const PoolCliOptions& o) {
   std::unique_ptr<HttpServer> server;
   if (o.web) server = startWeb(manager, catalog, *o.web, o.webToken);
   PoolSession session(manager, std::move(opts));
-  installSignalHandlers();
+  installSignalHandlers(false);
 
   std::atomic<bool> done{false};
   int rc = 1;

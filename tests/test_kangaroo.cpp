@@ -10,6 +10,8 @@
 #include "catalog/catalog.h"
 #include "core/gtable.h"
 #include "core/random.h"
+#include "engine/bytes.h"
+#include "engine/checkpoint.h"
 #include "engine/errors.h"
 #include "engine/job_manager.h"
 #include "engine/kangaroo_params.h"
@@ -182,4 +184,28 @@ TEST_CASE("kangaroo resumes from a checkpoint") {
     }
   }
   CHECK(seen);
+}
+
+TEST_CASE("kangaroo rejects a checkpoint with dp bits above 60") {
+  TempDir dir;
+  const ManagerOptions opts{dir.path / "state", dir.path / "found.jsonl"};
+  JobSpec s = cpuKangaroo(48);
+  s.checkpoint = true;
+  Checkpointer c(opts.stateDir, Algo::Kangaroo, resolve(s, catalog()).identity, true, false);
+  c.setSnapshot([] {
+    ByteWriter w;
+    w.u32(61);
+    for (int i = 0; i < 64; ++i) w.u256(U256::fromU64(1));
+    w.u64(0);  // jumps
+    w.u64(0);  // DP count
+    return std::move(w.data());
+  });
+  c.saveNow();
+
+  JobManager m(catalog(), opts);
+  m.start(s);
+  m.wait();
+  JobStatus st = m.status();
+  CHECK(st.outcome == Outcome::Error);
+  CHECK(st.error == "checkpoint " + c.path().string() + " is corrupt (use --fresh)");
 }

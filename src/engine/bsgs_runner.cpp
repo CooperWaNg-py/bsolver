@@ -8,7 +8,6 @@
 #include <set>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include "core/gtable.h"
@@ -154,23 +153,19 @@ struct Bsgs {
 void fillTable(RunContext& ctx, BabyTable& table, uint64_t m, unsigned threads) {
   std::atomic<uint64_t> nextChunk{0};
   const uint64_t chunks = (m + kFillChunk - 1) / kFillChunk;
-  std::vector<std::thread> pool;
-  for (unsigned t = 0; t < threads; ++t) {
-    pool.emplace_back([&] {
-      auto en = std::make_unique<PointEnumerator<1024>>();
-      for (;;) {
-        ctx.waitIfPaused();
-        if (ctx.shouldStop()) return;
-        uint64_t c = nextChunk.fetch_add(1);
-        if (c >= chunks) return;
-        uint64_t first = 1 + c * kFillChunk;
-        uint64_t count = std::min(kFillChunk, m - (first - 1));
-        en->run(U256::fromU64(first), count,
-                [&](uint64_t off, const Affine& P) { table.insert(P.x.n[0], first + off); });
-      }
-    });
-  }
-  for (auto& t : pool) t.join();
+  runThreads(ctx, threads, [&](size_t) {
+    auto en = std::make_unique<PointEnumerator<1024>>();
+    for (;;) {
+      ctx.waitIfPaused();
+      if (ctx.shouldStop()) return;
+      uint64_t c = nextChunk.fetch_add(1);
+      if (c >= chunks) return;
+      uint64_t first = 1 + c * kFillChunk;
+      uint64_t count = std::min(kFillChunk, m - (first - 1));
+      en->run(U256::fromU64(first), count,
+              [&](uint64_t off, const Affine& P) { table.insert(P.x.n[0], first + off); });
+    }
+  });
 }
 
 // Processes one block of giant indices: kLanes lanes of kLaneSteps consecutive indices each, all
@@ -265,10 +260,11 @@ bool runBsgs(RunContext& ctx) {
   const uint64_t totalBlocks = blocks > U256::fromU64(UINT64_MAX) ? UINT64_MAX : blocks.w[0];
 
   uint64_t startBlock = 0;
-  if (auto payload = ctx.checkpointer().load()) {
-    ByteReader r(*payload);
-    uint64_t savedBlock = r.u64();
-    uint64_t savedM = r.u64();
+  uint64_t savedBlock = 0, savedM = 0;
+  if (ctx.checkpointer().restore([&](ByteReader& r) {
+        savedBlock = r.u64();
+        savedM = r.u64();
+      })) {
     if (savedM == m) {
       startBlock = std::min(savedBlock, totalBlocks);
       ctx.setResumed(true);
@@ -332,31 +328,22 @@ bool runBsgs(RunContext& ctx) {
                mulG(negMod(U256::fromU64(s))),
                mulG(negMod(mulU64(U256::fromU64(s), kLaneSteps)))};
 
-  std::mutex errMu;
-  std::string error;
-  std::vector<std::thread> pool;
-  for (unsigned t = 0; t < threads; ++t) {
-    pool.emplace_back([&] {
-      try {
-        auto worker = std::make_unique<BlockWorker>(b);
-        while (!ctx.shouldStop()) {
-          ctx.waitIfPaused();
-          if (ctx.shouldStop()) break;
-          uint64_t block;
-          if (!source.next(&block)) break;
-          if (!worker->run(block)) break;
-          source.complete(block);
-          ctx.addWork(b.coveredWork(U256::fromU64(block) << kBlockShift, kBlockGiants));
-        }
-      } catch (const std::exception& ex) {
-        std::lock_guard<std::mutex> lock(errMu);
-        if (error.empty()) error = std::string("bsgs: ") + ex.what();
-        ctx.requestStop();
+  runThreads(ctx, threads, [&](size_t) {
+    try {
+      auto worker = std::make_unique<BlockWorker>(b);
+      while (!ctx.shouldStop()) {
+        ctx.waitIfPaused();
+        if (ctx.shouldStop()) break;
+        uint64_t block;
+        if (!source.next(&block)) break;
+        if (!worker->run(block)) break;
+        source.complete(block);
+        ctx.addWork(b.coveredWork(U256::fromU64(block) << kBlockShift, kBlockGiants));
       }
-    });
-  }
-  for (auto& t : pool) t.join();
-  if (!error.empty()) throw std::runtime_error(error);
+    } catch (const std::exception& ex) {
+      throw std::runtime_error(std::string("bsgs: ") + ex.what());
+    }
+  });
 
   const bool exhausted = source.finished();
   snapshot.finish(exhausted || ctx.anyFound());

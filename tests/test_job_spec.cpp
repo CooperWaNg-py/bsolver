@@ -66,6 +66,23 @@ TEST_CASE("resolve errors") {
   CHECK_THROWS_WITH(spec(R"({"puzzle":1,"bogus":2})"), "unknown field 'bogus'");
 }
 
+TEST_CASE("resolve rejects out-of-range resource limits") {
+  CHECK_THROWS_WITH(resolve(spec(R"({"puzzle":140,"dpBits":61})"), catalog()), "dp bits must be 0-60");
+  CHECK_THROWS_WITH(resolve(spec(R"({"puzzle":140,"dpBits":-1})"), catalog()), "dp bits must be 0-60");
+  CHECK(resolve(spec(R"({"puzzle":140,"dpBits":60})"), catalog()).algorithm == Algo::Kangaroo);
+
+  CHECK_THROWS_WITH(resolve(spec(R"({"puzzle":20,"threads":1025})"), catalog()), "threads must be 0-1024");
+  CHECK_THROWS_WITH(resolve(spec(R"({"puzzle":20,"threads":-1})"), catalog()), "threads must be 0-1024");
+  CHECK_NOTHROW(resolve(spec(R"({"puzzle":20,"threads":1024})"), catalog()));
+
+  const std::string memError = "bsgsMemoryMb must be 1-" + std::to_string(maxBsgsMemoryMb());
+  CHECK_THROWS_WITH(resolve(spec(R"({"puzzle":40,"algorithm":"bsgs","bsgsMemoryMb":0})"), catalog()), memError);
+  CHECK_THROWS_WITH(resolve(spec(R"({"puzzle":40,"algorithm":"bsgs","bsgsMemoryMb":-1})"), catalog()), memError);
+  CHECK_NOTHROW(resolve(spec(R"({"puzzle":40,"algorithm":"bsgs","bsgsMemoryMb":64})"), catalog()));
+  // Only BSGS allocates the table.
+  CHECK_NOTHROW(resolve(spec(R"({"puzzle":20,"algorithm":"scan","bsgsMemoryMb":-1})"), catalog()));
+}
+
 TEST_CASE("solved puzzle warns but resolves") {
   auto r = resolve(spec(R"({"puzzle":20})"), catalog());
   REQUIRE(r.warnings.size() == 1);

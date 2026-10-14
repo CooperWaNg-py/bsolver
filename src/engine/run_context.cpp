@@ -1,5 +1,8 @@
 #include "engine/run_context.h"
 
+#include <exception>
+#include <thread>
+
 #include "core/address.h"
 #include "core/gtable.h"
 
@@ -101,7 +104,7 @@ bool RunContext::reportFound(const U256& key, const Affine& pub) {
     fk.address = encodeP2PKH(*hit);
     fk.pubkey = pubkeyHex(actual, compressedHit);
     fk.privkey = key.toHex(true);
-    fk.wif = wifCompressed(key);
+    fk.wif = compressedHit ? wifCompressed(key) : wifUncompressed(key);
     fk.algorithm = std::string(toString(job_.algorithm));
     fk.backend = backend_;
     foundList_.push_back(fk);
@@ -109,6 +112,35 @@ bool RunContext::reportFound(const U256& key, const Affine& pub) {
   }
   found_(fk);
   return true;
+}
+
+void runThreads(RunContext& ctx, size_t n, const std::function<void(size_t)>& body) {
+  std::mutex mu;
+  std::exception_ptr error;
+  auto fail = [&](std::exception_ptr e) {
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      if (!error) error = std::move(e);
+    }
+    ctx.requestStop();
+  };
+  std::vector<std::thread> threads;
+  try {
+    threads.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+      threads.emplace_back([&, i] {
+        try {
+          body(i);
+        } catch (...) {
+          fail(std::current_exception());
+        }
+      });
+    }
+  } catch (...) {
+    fail(std::current_exception());
+  }
+  for (auto& t : threads) t.join();
+  if (error) std::rethrow_exception(error);
 }
 
 }  // namespace bsolver

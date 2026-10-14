@@ -2,6 +2,13 @@
 
 #include <algorithm>
 #include <set>
+#include <string>
+
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
 
 #include <nlohmann/json.hpp>
 
@@ -12,6 +19,19 @@
 namespace bsolver {
 
 namespace {
+uint64_t physicalMemoryBytes() {
+#if defined(_WIN32)
+  MEMORYSTATUSEX st{};
+  st.dwLength = sizeof st;
+  return GlobalMemoryStatusEx(&st) ? st.ullTotalPhys : 0;
+#elif defined(_SC_PHYS_PAGES)
+  long pages = sysconf(_SC_PHYS_PAGES), pageSize = sysconf(_SC_PAGESIZE);
+  return pages > 0 && pageSize > 0 ? static_cast<uint64_t>(pages) * static_cast<uint64_t>(pageSize) : 0;
+#else
+  return 0;
+#endif
+}
+
 std::string_view algorithmName(Algorithm a) {
   switch (a) {
     case Algorithm::Auto: return "auto";
@@ -136,6 +156,8 @@ ResolvedJob resolve(const JobSpec& spec, const Catalog& catalog) {
     throw JobError("puzzle and explicit addresses/pubkey are mutually exclusive");
   }
   if (spec.bits && (*spec.bits < 1 || *spec.bits > 256)) throw JobError("bits must be 1-256");
+  if (spec.threads > kMaxThreads) throw JobError("threads must be 0-" + std::to_string(kMaxThreads));
+  if (spec.dpBits && *spec.dpBits > kMaxDpBits) throw JobError("dp bits must be 0-" + std::to_string(kMaxDpBits));
 
   const Puzzle* puzzle = nullptr;
   std::set<Hash160> targets;
@@ -214,6 +236,12 @@ ResolvedJob resolve(const JobSpec& spec, const Catalog& catalog) {
     throw JobError("kangaroo requires a range width >= 2^32; use bsgs or scan");
   }
   if (r.algorithm != Algo::Scan && spec.order == Order::Random) throw JobError("--order applies only to scan");
+  if (r.algorithm == Algo::Bsgs) {
+    const uint32_t maxMb = maxBsgsMemoryMb();
+    if (spec.bsgsMemoryMb < 1 || spec.bsgsMemoryMb > maxMb) {
+      throw JobError("bsgsMemoryMb must be 1-" + std::to_string(maxMb));
+    }
+  }
 
   if (r.algorithm == Algo::Scan && targets.empty()) {
     // Only a pubkey: hash it in its given encoding.
@@ -235,6 +263,16 @@ ResolvedJob resolve(const JobSpec& spec, const Catalog& catalog) {
   }
   r.identity += "|" + std::string(toString(r.addressMode));
   return r;
+}
+
+uint32_t maxBsgsMemoryMb() {
+  // The table is the smallest power of two >= the request (and is zero-filled up front), so the largest request
+  // that is a power of two not above half the physical memory keeps the table within half of it.
+  const uint64_t halfMb = physicalMemoryBytes() >> 21;
+  if (halfMb == 0) return kFallbackMaxBsgsMemoryMb;
+  uint64_t mb = 1;
+  while (mb * 2 <= halfMb && mb * 2 <= UINT32_MAX) mb *= 2;
+  return static_cast<uint32_t>(mb);
 }
 
 }  // namespace bsolver

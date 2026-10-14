@@ -38,6 +38,9 @@ void appendResult(const std::filesystem::path& path, const FoundKey& key) {
   std::ofstream out(path, std::ios::app | std::ios::binary);
   if (!out) throw std::runtime_error("cannot open results file " + path.string());
   out << nlohmann::json(key).dump() << "\n";
+  // close() flushes; without this check a full disk would silently drop the found key.
+  out.close();
+  if (!out) throw std::runtime_error("cannot write results file " + path.string());
 }
 
 std::vector<FoundKey> readResults(const std::filesystem::path& path) {

@@ -17,6 +17,14 @@ std::string base58Check(std::vector<uint8_t> payload) {
   payload.insert(payload.end(), chk, chk + 4);
   return base58Encode(payload.data(), payload.size());
 }
+
+std::string wif(const U256& key, bool compressed) {
+  std::vector<uint8_t> payload(compressed ? 34 : 33);
+  payload[0] = 0x80;
+  key.toBytesBE(payload.data() + 1);
+  if (compressed) payload[33] = 0x01;
+  return base58Check(std::move(payload));
+}
 }  // namespace
 
 Hash160 decodeP2PKH(std::string_view address) {
@@ -41,13 +49,9 @@ std::string encodeP2PKH(const uint8_t h[20]) {
 
 std::string encodeP2PKH(const Hash160& h) { return encodeP2PKH(h.data()); }
 
-std::string wifCompressed(const U256& key) {
-  std::vector<uint8_t> payload(34);
-  payload[0] = 0x80;
-  key.toBytesBE(payload.data() + 1);
-  payload[33] = 0x01;
-  return base58Check(std::move(payload));
-}
+std::string wifCompressed(const U256& key) { return wif(key, true); }
+
+std::string wifUncompressed(const U256& key) { return wif(key, false); }
 
 Hash160 hash160Of(const Affine& p, bool compressed) {
   Hash160 h;

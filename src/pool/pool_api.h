@@ -31,8 +31,9 @@ class PoolError : public std::runtime_error {
   bool retryable_;
 };
 
-// Parses the GET /puzzle/{n}/range response. Throws PoolError (not retryable) when fields are missing/invalid.
-PoolRange parseRangeResponse(const std::string& body);
+// Parses the GET /puzzle/{n}/range response. Throws PoolError (not retryable) when fields are missing/invalid or,
+// with checkBounds, when the range starts at 0, wraps past 2^256 or ends at/after the secp256k1 order.
+PoolRange parseRangeResponse(const std::string& body, bool checkBounds = true);
 
 // SHA256 over the concatenated proof keys (64 uppercase hex digits each, in proofAddresses order), lowercase hex:
 // the HashedProofKey header.

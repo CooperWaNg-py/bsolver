@@ -52,8 +52,9 @@ std::optional<PoolState> PoolState::load(const std::filesystem::path& path) {
     const json& a = j.at("assignment");
     if (!a.is_null()) {
       PoolAssignment pa;
-      // Re-validate through the same parser as live API responses.
-      pa.range = parseRangeResponse(a.at("range").dump());
+      // Re-validate through the same parser as live API responses. Bounds are not checked here: a saved range the
+      // engine rejects is dropped by the session (with an error) instead of making the whole state unreadable.
+      pa.range = parseRangeResponse(a.at("range").dump(), false);
       pa.proofKeys = a.at("proofKeys").get<std::map<std::string, std::string>>();
       pa.scanComplete = a.at("scanComplete").get<bool>();
       pa.assignedAt = a.value("assignedAt", std::string());
@@ -87,6 +88,8 @@ void PoolState::save(const std::filesystem::path& path) const {
   {
     std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
     out << j.dump(2) << "\n";
+    out.flush();
+    out.close();
     if (!out) throw std::runtime_error("cannot write pool state " + tmp.string());
   }
   std::filesystem::rename(tmp, path);

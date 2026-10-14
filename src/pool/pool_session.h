@@ -64,6 +64,10 @@ class PoolSession {
   void notifierLoop();
   void pingLoop();
   void saveState();
+  void setPingHex(const std::string& hex);  // empty: no keepalive pings
+  // Forgets the current assignment (persisted) so the next loop iteration fetches a new range.
+  void dropAssignment();
+  std::string keyChannels() const;  // notification channels that carry a found key
   std::string display(const std::string& hex) const;
   void log(LogLevel level, const std::string& msg) { manager_.log(level, "pool: " + msg); }
 
@@ -75,6 +79,7 @@ class PoolSession {
   std::string backend_;
   int gpuCount_ = 1;
   uint64_t submittedThisRun_ = 0;
+  bool resumedAssignment_ = false;  // the current assignment came from the saved state (run() thread only)
 
   std::mutex stateMu_;  // guards state_
   PoolState state_;

@@ -7,6 +7,7 @@
 
 #include "core/address.h"
 #include "core/hex.h"
+#include "core/scalar.h"
 #include "core/sha256.h"
 #include "pool/http_client.h"
 
@@ -60,7 +61,7 @@ U256 PoolRange::start() const { return U256::fromHex(hex + workloadStart); }
 
 U256 PoolRange::end() const { return start() + U256::fromHex(workloadEnd); }
 
-PoolRange parseRangeResponse(const std::string& body) {
+PoolRange parseRangeResponse(const std::string& body, bool checkBounds) {
   PoolRange r;
   try {
     json j = json::parse(body);
@@ -81,6 +82,15 @@ PoolRange parseRangeResponse(const std::string& body) {
     for (const auto& a : r.proofAddresses) decodeP2PKH(a);
   } catch (const std::invalid_argument& ex) {
     throw PoolError(std::string("invalid range response: ") + ex.what(), false);
+  }
+  if (checkBounds) {
+    const U256 start = r.start();
+    U256 end;
+    const bool overflow = add(end, start, U256::fromHex(r.workloadEnd)) != 0;
+    if (start.isZero()) throw PoolError("invalid range response: range starts at key 0", false);
+    if (overflow || end >= kOrderN) {
+      throw PoolError("invalid range response: range end is beyond the secp256k1 order", false);
+    }
   }
   return r;
 }
