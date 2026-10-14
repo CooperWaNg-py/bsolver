@@ -4,3 +4,4 @@ webui/node_modules/
 bsolver-state/
 bsolver-found.jsonl
 .DS_Store
+pool.conf

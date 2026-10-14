@@ -46,6 +46,7 @@ struct JobStatus {
   double elapsedSeconds = 0;
   std::optional<std::string> startedAt;
   bool resumed = false;
+  bool exhausted = false;  // the whole range was covered (scan/bsgs)
   std::vector<FoundKey> found;
   std::vector<BenchResult> benchmark;
 };

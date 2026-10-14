@@ -18,6 +18,10 @@ jobs:
         with:
           node-version: 22
 
+      - name: Install libcurl (pool client)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
+
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBSOLVER_CUDA=OFF
 

@@ -71,6 +71,7 @@ export type JobStatus = {
   elapsedSeconds: number;
   startedAt: string | null;
   resumed: boolean;
+  exhausted: boolean; // the whole range was covered (scan/bsgs)
   found: FoundKey[];
   benchmark: BenchResult[];
 };

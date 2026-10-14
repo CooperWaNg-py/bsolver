@@ -185,6 +185,7 @@ void JobManager::runJob(std::shared_ptr<ActiveJob> job) {
       std::lock_guard<std::mutex> lock(mu_);
       st_.state = JobState::Finished;
       st_.outcome = outcome;
+      st_.exhausted = exhausted;
       job->finished = std::chrono::steady_clock::now();
     }
     log(LogLevel::Info, "job finished: " + std::string(toString(outcome)));
@@ -359,16 +360,27 @@ void JobManager::log(LogLevel level, const std::string& msg) {
   publish(Event{"log", nlohmann::json{{"time", isoTimeNow()}, {"level", toString(level)}, {"message", msg}}});
 }
 
+void JobManager::setFoundHandler(std::function<void(const FoundKey&)> fn) {
+  std::lock_guard<std::mutex> lock(resultsMu_);
+  foundHandler_ = std::move(fn);
+}
+
 void JobManager::onFound(const FoundKey& key) {
+  bool handled = false;
   {
     std::lock_guard<std::mutex> lock(resultsMu_);
-    try {
-      appendResult(options_.resultsPath, key);
-    } catch (const std::exception& ex) {
-      log(LogLevel::Error, ex.what());
+    if (foundHandler_) {
+      foundHandler_(key);
+      handled = true;
+    } else {
+      try {
+        appendResult(options_.resultsPath, key);
+      } catch (const std::exception& ex) {
+        log(LogLevel::Error, ex.what());
+      }
     }
   }
-  consoleOut(foundLine(key));
+  if (!handled) consoleOut(foundLine(key));
   publish(Event{"found", nlohmann::json(key)});
 }
 

@@ -56,6 +56,10 @@ class JobManager {
   // Blocks until no job is active.
   void wait();
 
+  // Replaces the default found-key handling (results file + "FOUND" line) for every later key.
+  // Called serialized on a worker thread; keep it short. The "found" event is still published.
+  void setFoundHandler(std::function<void(const FoundKey&)> fn);
+
   void log(LogLevel level, const std::string& msg);
   const ManagerOptions& options() const { return options_; }
   const Catalog& catalog() const { return catalog_; }
@@ -81,6 +85,7 @@ class JobManager {
   std::mutex controlMu_;  // serializes start()/bench() (thread joins happen outside mu_)
   bool benchRunning_ = false;
   std::mutex resultsMu_;
+  std::function<void(const FoundKey&)> foundHandler_;  // guarded by resultsMu_
 
   std::mutex subMu_;
   std::map<int, std::function<void(const Event&)>> subs_;

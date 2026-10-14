@@ -58,6 +58,7 @@ void to_json(nlohmann::json& j, const JobStatus& s) {
       {"elapsedSeconds", s.elapsedSeconds},
       {"startedAt", opt(s.startedAt)},
       {"resumed", s.resumed},
+      {"exhausted", s.exhausted},
       {"found", s.found},
       {"benchmark", s.benchmark},
   };

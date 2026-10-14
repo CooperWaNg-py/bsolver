@@ -109,7 +109,8 @@ bool runScan(RunContext& ctx, Backend& backend) {
 
   // Random order is exhausted only when the small-key prefix covered the whole range.
   bool exhausted = seq ? seq->finished() : (!rnd && prefixDone);
-  snapshot.finish(exhausted || ctx.anyFound());
+  // Without stopOnFound the job's purpose is the whole range, so a stop keeps the checkpoint.
+  snapshot.finish(exhausted || (ctx.spec().stopOnFound && ctx.allFound()));
   return exhausted;
 }
 

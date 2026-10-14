@@ -1,11 +1,13 @@
 #include <CLI/CLI.hpp>
 #include <nlohmann/json.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -24,6 +26,7 @@
 #include "engine/errors.h"
 #include "engine/format.h"
 #include "engine/job_manager.h"
+#include "pool/pool_session.h"
 #include "server/http_server.h"
 
 using namespace bsolver;
@@ -31,7 +34,11 @@ using namespace bsolver;
 namespace {
 
 volatile std::sig_atomic_t gSignal = 0;
-extern "C" void onSignal(int sig) { gSignal = sig; }
+volatile std::sig_atomic_t gSignalCount = 0;
+extern "C" void onSignal(int sig) {
+  gSignal = sig;
+  gSignalCount = gSignalCount + 1;
+}
 
 void installSignalHandlers() {
   std::signal(SIGINT, onSignal);
@@ -283,6 +290,104 @@ int cmdRun(const RunOptions& o) {
   return 1;
 }
 
+struct PoolCliOptions {
+  std::optional<std::string> config;
+  std::optional<std::string> token, worker, customRange, apiShare, telegramToken, telegramChatId, pubkey, buildHash,
+      apiUrl;
+  std::optional<int> puzzle;
+  bool saveKey = false;
+  std::string backend = "auto";
+  unsigned threads = 0;
+  std::vector<int> devices;
+  std::optional<uint64_t> ranges;
+  std::string stateDir = "bsolver-state";
+  std::string results = "bsolver-found.jsonl";
+  std::optional<std::string> web;
+  std::string webToken;
+};
+
+int cmdPool(const PoolCliOptions& o) {
+  PoolSessionOptions opts;
+  std::vector<std::string> warnings;
+  // Same pool.conf as the official client; ./pool.conf is used when present.
+  if (o.config) {
+    opts.config = PoolConfig::loadFile(*o.config, &warnings);
+  } else if (std::filesystem::exists("pool.conf")) {
+    opts.config = PoolConfig::loadFile("pool.conf", &warnings);
+    consoleLog("[info] using ./pool.conf");
+  }
+  PoolConfig& c = opts.config;
+  if (o.token) c.userToken = *o.token;
+  if (o.puzzle) c.targetPuzzle = *o.puzzle;
+  if (o.worker) c.workerName = *o.worker;
+  if (o.customRange) c.customRange = *o.customRange;
+  if (o.apiShare) {
+    c.apiShare = true;
+    c.apiShareUrl = *o.apiShare;
+  }
+  if (o.telegramToken) {
+    c.telegramShare = true;
+    c.telegramToken = *o.telegramToken;
+  }
+  if (o.telegramChatId) {
+    c.telegramShare = true;
+    c.telegramChatId = *o.telegramChatId;
+  }
+  if (o.pubkey) {  // like the official client's -pubkey: implies untrusted_computer
+    c.setPublicKey(*o.pubkey);
+    c.untrustedComputer = true;
+  }
+  if (o.saveKey) c.saveKey = true;
+  if (o.buildHash) c.buildHash = *o.buildHash;
+  if (o.apiUrl) c.apiUrl = *o.apiUrl;
+  for (const auto& w : warnings) consoleLog("[warn] " + w);
+  if (c.untrustedComputer && o.web) {
+    std::cerr << "error: --web would expose found keys in plaintext; it cannot be used with untrusted_computer\n";
+    return 1;
+  }
+  opts.backend = o.backend;
+  opts.threads = o.threads;
+  opts.devices = o.devices;
+  opts.maxRanges = o.ranges;
+
+  Catalog catalog = Catalog::builtin();
+  JobManager manager(catalog, ManagerOptions{o.stateDir, o.results});
+  std::unique_ptr<HttpServer> server;
+  if (o.web) server = startWeb(manager, catalog, *o.web, o.webToken);
+  PoolSession session(manager, std::move(opts));
+  installSignalHandlers();
+
+  std::atomic<bool> done{false};
+  int rc = 1;
+  std::thread worker([&] {
+    rc = session.run();
+    done = true;
+  });
+  bool interrupted = false;
+  auto lastPrint = std::chrono::steady_clock::now();
+  while (!done) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    if (gSignalCount >= 2) {
+      consoleLog("[warn] second interrupt: exiting immediately (scan progress since the last checkpoint is lost)");
+      std::_Exit(130);
+    }
+    if (gSignal && !interrupted) {
+      interrupted = true;
+      consoleLog("[info] interrupted; saving progress (resume with the same command; Ctrl-C again to quit now)");
+      session.requestStop();
+    }
+    auto now = std::chrono::steady_clock::now();
+    if (now - lastPrint >= std::chrono::seconds(1)) {
+      lastPrint = now;
+      JobStatus s = manager.status();
+      if (isActive(s.state)) consoleProgress(progressLine(s));
+    }
+  }
+  worker.join();
+  consoleFinishProgress();
+  return rc;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -354,6 +459,32 @@ int main(int argc, char** argv) {
   bench->add_option("--seconds", benchSeconds, "Seconds per backend");
   bench->add_option("--threads", benchThreads, "CPU threads (0 = all)");
 
+  // pool
+  auto* pool = app.add_subcommand(
+      "pool", "Work for the btcpuzzle.info pool (reads ./pool.conf like the official client; progress is saved)");
+  PoolCliOptions po;
+  pool->add_option("--config", po.config, "pool.conf of the official client (default ./pool.conf if present)");
+  pool->add_option("--token", po.token, "User token from btcpuzzle.info (user_token)");
+  pool->add_option("--puzzle", po.puzzle, "Target puzzle (target_puzzle; 38 is the test pool)");
+  pool->add_option("--worker", po.worker, "Worker name, max 15 characters (worker_name)");
+  pool->add_option("--custom-range", po.customRange, "custom_range setting");
+  pool->add_option("--api-share", po.apiShare, "Webhook URL for notifications (api_share_url)");
+  pool->add_option("--telegram-token", po.telegramToken, "Telegram bot token");
+  pool->add_option("--telegram-chat-id", po.telegramChatId, "Telegram chat id");
+  pool->add_option("--pubkey", po.pubkey, "RSA public key PEM ('|' as line separator); enables untrusted_computer");
+  pool->add_flag("--save-key", po.saveKey, "Save the RSA-encrypted found key to the btcpuzzle.info account");
+  pool->add_option("--build-hash", po.buildHash, "BUILD_HASH used in the security hash (build_hash)");
+  pool->add_option("--api-url", po.apiUrl, "Pool API base URL")->group("");
+  pool->add_option("--backend", po.backend, "Compute backend (auto benchmarks once)")
+      ->check(CLI::IsMember({"auto", "cpu", "opencl", "metal", "cuda"}));
+  pool->add_option("--threads", po.threads, "CPU threads (0 = all)");
+  pool->add_option("--devices", po.devices, "GPU device indices (e.g. 0,1)")->delimiter(',');
+  pool->add_option("--ranges", po.ranges, "Stop after submitting N ranges");
+  pool->add_option("--state-dir", po.stateDir, "Progress directory (range assignment + scan checkpoint)");
+  pool->add_option("--results", po.results, "Found target keys file (JSON lines)");
+  pool->add_option("--web", po.web, "Also serve the web UI/API on HOST:PORT");
+  pool->add_option("--web-token", po.webToken, "Web API bearer token (default: $BSOLVER_TOKEN or random)");
+
   CLI11_PARSE(app, argc, argv);
   try {
     if (*puzzles) return cmdPuzzles(unsolvedOnly, puzzleId, puzzlesCatalog, puzzlesJson);
@@ -361,6 +492,7 @@ int main(int argc, char** argv) {
     if (*devices) return cmdDevices();
     if (*bench) return cmdBench(benchAlgo, benchSeconds, benchThreads);
     if (*serve) return cmdServe(serveListen, serveToken, serveStateDir, serveResults, serveCatalog);
+    if (*pool) return cmdPool(po);
   } catch (const std::exception& ex) {
     std::cerr << "error: " << ex.what() << "\n";
     return 1;

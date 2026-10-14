@@ -14,6 +14,7 @@ option(BSOLVER_OPENCL "Build the OpenCL backend when OpenCL is found" ON)
 option(BSOLVER_METAL "Build the Metal backend (Apple only)" ON)
 option(BSOLVER_CUDA "Build the CUDA backend when a CUDA toolkit is found" ON)
 option(BSOLVER_NATIVE "Optimize for the host CPU" OFF)
+option(BSOLVER_POOL "btcpuzzle.info pool client (needs libcurl except on Windows)" ON)
 option(BSOLVER_TESTS "Build the test suite" ON)
 
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
@@ -39,6 +40,7 @@ include(Dependencies)
 include(Embed)
 include(Backends)
 include(WebUI)
+include(Https)
 
 file(GLOB_RECURSE BSOLVER_CORE_SOURCES CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/src/core/*.cpp
@@ -47,7 +49,8 @@ file(GLOB_RECURSE BSOLVER_CORE_SOURCES CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/src/server/*.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/backend/*.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/backend/cpu/*.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/backend/gpu/*.cpp)
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/backend/gpu/*.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/pool/*.cpp)
 # Toolkit-specific backends are added by cmake/Backends.cmake only when their toolkit is found.
 list(FILTER BSOLVER_CORE_SOURCES EXCLUDE REGEX "/src/backend/(opencl|metal|cuda)/")
 
@@ -63,10 +66,12 @@ add_library(bsolver_core STATIC
 target_include_directories(bsolver_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_definitions(bsolver_core PUBLIC
   BSOLVER_VERSION="${PROJECT_VERSION}"
-  ${BSOLVER_BACKEND_DEFINITIONS})
+  ${BSOLVER_BACKEND_DEFINITIONS}
+  ${BSOLVER_HTTPS_DEFINITIONS})
 target_link_libraries(bsolver_core PUBLIC
   Threads::Threads nlohmann_json::nlohmann_json httplib::httplib
-  ${BSOLVER_BACKEND_LIBRARIES})
+  ${BSOLVER_BACKEND_LIBRARIES}
+  ${BSOLVER_HTTPS_LIBRARIES})
 if(WIN32)
   target_link_libraries(bsolver_core PUBLIC ws2_32)
   target_compile_definitions(bsolver_core PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
