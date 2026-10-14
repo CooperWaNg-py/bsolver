@@ -87,7 +87,7 @@ void PoolState::save(const std::filesystem::path& path) const {
   tmp += ".tmp";
   {
     std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-    out << j.dump(2) << "\n";
+    out << j.dump(2, ' ', false, json::error_handler_t::replace) << "\n";
     out.flush();
     out.close();
     if (!out) throw std::runtime_error("cannot write pool state " + tmp.string());

@@ -113,6 +113,9 @@ void PoolConfig::validate() const {
   if (userToken.size() != 128) fail("user_token must be 128 characters long");
   if (targetPuzzle < 1 || targetPuzzle > 160) fail("target_puzzle must be 1-160");
   if (workerName.size() > 15) fail("worker_name must be at most 15 characters");
+  for (unsigned char ch : workerName) {
+    if (ch < 0x21 || ch > 0x7e) fail("worker_name must use printable ASCII characters without spaces");
+  }
   if (untrustedComputer && !telegramShare && !apiShare && publicKey.empty()) {
     fail("untrusted_computer requires telegram_share, api_share or public_key; otherwise found keys would be lost");
   }

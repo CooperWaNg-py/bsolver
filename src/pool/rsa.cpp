@@ -373,7 +373,8 @@ RsaPublicKey parseRsaPublicKeyPem(std::string_view pem) {
     std::vector<uint8_t> der = base64Decode(pem.substr(bodyStart, e - bodyStart));
     RsaPublicKey key = kind.spki ? parseSpki(der.data(), der.size())
                                  : parsePkcs1(der.data(), der.size());
-    if (key.n.size() < 64 || key.n.size() > 2048) fail("unsupported modulus size");
+    // OAEP-SHA1 of a 64-hex-digit private key needs a modulus of at least 106 bytes; require 1024 bits.
+    if (key.n.size() < 128 || key.n.size() > 2048) fail("modulus must be 1024-16384 bits");
     if ((key.n.back() & 1) == 0) fail("even modulus");
     if (key.e.size() > key.n.size() || (key.e.size() == 1 && key.e[0] < 3) ||
         (key.e.back() & 1) == 0)

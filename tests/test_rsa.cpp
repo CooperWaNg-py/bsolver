@@ -121,6 +121,12 @@ TEST_CASE("RSA: error cases", "[rsa]") {
   CHECK_THROWS_WITH(parseRsaPublicKeyPem(truncated), StartsWith("invalid RSA public key: "));
   CHECK_THROWS_WITH(parseRsaPublicKeyPem("-----BEGIN PUBLIC KEY-----\nMIGf"),
                     StartsWith("invalid RSA public key: "));
+  // 512-bit key: too small for OAEP-SHA1 of a 64-digit private key, rejected when configured.
+  CHECK_THROWS_WITH(parseRsaPublicKeyPem("-----BEGIN PUBLIC KEY-----\n"
+                                         "MFwwDQYJKoZIhvcNAQEBBQADSwAwSAJBAKkwhN3yc73MUMqVzdk5h8BDaXFpqm/y\n"
+                                         "v4uR5XGkczSLOSxzf88xlwNI8vqZx3SvOwWBSI5keEtglezUmA4SOncCAwEAAQ==\n"
+                                         "-----END PUBLIC KEY-----\n"),
+                    "invalid RSA public key: modulus must be 1024-16384 bits");
 
   RsaPublicKey key = parseRsaPublicKeyPem(kExamplePubPem);
   std::array<uint8_t, 20> seed{};

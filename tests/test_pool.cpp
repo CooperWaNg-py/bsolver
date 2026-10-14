@@ -80,6 +80,12 @@ TEST_CASE("pool config validation") {
   CHECK_THROWS_WITH(c.validate(), "user_token must be 128 characters long");
   c.userToken = std::string(128, 'a');
   c.validate();
+  c.workerName = "J\xf6rg";  // Latin-1 / ANSI bytes would break the pool state JSON and headers
+  CHECK_THROWS_WITH(c.validate(), "worker_name must use printable ASCII characters without spaces");
+  c.workerName = "rig 1";
+  CHECK_THROWS(c.validate());
+  c.workerName = "rig-1_a.b";
+  c.validate();
   c.untrustedComputer = true;
   CHECK_THROWS(c.validate());
   c.telegramShare = true;
