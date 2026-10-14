@@ -11,9 +11,9 @@ class Ripemd160 {
   void update(const uint8_t* data, size_t len);
   void final(uint8_t out[20]);
 
+ private:
   static void transform(uint32_t state[5], const uint8_t block[64]);
 
- private:
   uint32_t s_[5];
   uint8_t buf_[64];
   size_t bufLen_ = 0;

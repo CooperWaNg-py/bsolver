@@ -285,6 +285,10 @@ ResolvedJob resolve(const JobSpec& spec, const Catalog& catalog, uint32_t bsgsCa
     r.identity += pubkeyHex(*r.pubkey);
   }
   r.identity += "|" + std::string(toString(r.addressMode));
+  // Random order is a keyed block permutation; the suffix keeps checkpoints of the old with-replacement sampler apart.
+  if (r.algorithm == Algo::Scan && r.order == Order::Random) r.identity += "|perm";
+  // Symmetric (negation-map) kangaroo; the suffix keeps checkpoints of the old one-sided walk apart.
+  if (r.algorithm == Algo::Kangaroo) r.identity += "|sym";
   return r;
 }
 

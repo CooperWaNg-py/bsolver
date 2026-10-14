@@ -80,6 +80,7 @@ class ClQueue {
   }
 
   uint32_t threads() const { return threads_; }
+  uint32_t group() const { return group_; }
   std::string label() const { return "opencl#" + std::to_string(dev_.info.index); }
 
   Mem buffer(size_t bytes, const void* init = nullptr) {
@@ -97,14 +98,14 @@ class ClQueue {
     check(clEnqueueReadBuffer(queue_.get(), m.get(), CL_TRUE, offset, bytes, data, 0, nullptr, nullptr),
           "clEnqueueReadBuffer");
   }
-  // Binds the buffers as kernel arguments 0..n-1, runs threads() work items and waits.
-  void run(std::initializer_list<const Mem*> args) {
+  // Binds the buffers as kernel arguments 0..n-1, runs `count` work items (a multiple of group()) and waits.
+  void run(std::initializer_list<const Mem*> args, uint32_t count) {
     cl_uint i = 0;
     for (const Mem* m : args) {
       cl_mem h = m->get();
       check(clSetKernelArg(kernel_.get(), i++, sizeof(cl_mem), &h), "clSetKernelArg");
     }
-    size_t global = threads_, local = group_;
+    size_t global = count, local = group_;
     check(clEnqueueNDRangeKernel(queue_.get(), kernel_.get(), 1, nullptr, &global, &local, 0, nullptr, nullptr),
           "clEnqueueNDRangeKernel");
     check(clFinish(queue_.get()), "clFinish");
@@ -122,9 +123,10 @@ class ClScanKernel final : public gpu::ScanKernel {
   explicit ClScanKernel(const ClDevice& dev) : q_(dev, "scan_kernel") {
     params_ = q_.buffer(gpu::kScanParamWords * 8);
     hits_ = q_.buffer(gpu::kHitCapacity * sizeof(gpu::ScanHit));
-    hitCount_ = q_.buffer(4);
+    counters_ = q_.buffer(gpu::kCounterWords * 4);
   }
   uint32_t threads() const override { return q_.threads(); }
+  uint32_t groupSize() const override { return q_.group(); }
   void setTables(const std::vector<uint64_t>& gTable, const std::vector<uint32_t>& targets) override {
     gTable_ = q_.buffer(gTable.size() * 8, gTable.data());
     targets_ = q_.buffer(targets.size() * 4, targets.data());
@@ -132,60 +134,72 @@ class ClScanKernel final : public gpu::ScanKernel {
   void setOffsets(const std::vector<uint64_t>& offsets) override {
     offsets_ = q_.buffer(offsets.size() * 8, offsets.data());
   }
-  uint32_t launch(const std::array<uint64_t, gpu::kScanParamWords>& params, std::vector<gpu::ScanHit>& hits) override {
-    const uint32_t zero = 0;
+  gpu::LaunchResult launch(const std::array<uint64_t, gpu::kScanParamWords>& params, uint32_t count,
+                           std::vector<gpu::ScanHit>& hits) override {
+    const uint32_t zero[gpu::kCounterWords] = {};
     q_.write(params_, 0, params.data(), sizeof(params));
-    q_.write(hitCount_, 0, &zero, 4);
-    q_.run({&params_, &offsets_, &gTable_, &targets_, &hits_, &hitCount_});
-    uint32_t count = 0;
-    q_.read(hitCount_, 0, &count, 4);
-    hits.resize(std::min(count, gpu::kHitCapacity));
+    q_.write(counters_, 0, zero, sizeof(zero));
+    q_.run({&params_, &offsets_, &gTable_, &targets_, &hits_, &counters_}, count);
+    uint32_t counters[gpu::kCounterWords];
+    q_.read(counters_, 0, counters, sizeof(counters));
+    gpu::LaunchResult out;
+    out.count = counters[0];
+    out.finished = counters[1];
+    hits.resize(std::min(out.count, gpu::kHitCapacity));
     if (!hits.empty()) q_.read(hits_, 0, hits.data(), hits.size() * sizeof(gpu::ScanHit));
-    return count;
+    return out;
   }
   std::string label() const override { return q_.label(); }
 
  private:
   ClQueue q_;
-  Mem params_, offsets_, gTable_, targets_, hits_, hitCount_;
+  Mem params_, offsets_, gTable_, targets_, hits_, counters_;
 };
 
 class ClKangarooKernel final : public gpu::KangarooKernel {
  public:
   explicit ClKangarooKernel(const ClDevice& dev) : q_(dev, "kangaroo_kernel") {
     params_ = q_.buffer(gpu::kKangarooParamWords * 8);
-    state_ = q_.buffer(gpu::kStateComponents * size_t{threads()} * gpu::kKangaroosPerThread * 8);
-    dpCount_ = q_.buffer(4);
+    for (auto& s : state_) s = q_.buffer(gpu::kangarooStateWords(threads()) * 8);
+    counters_ = q_.buffer(gpu::kCounterWords * 4);
   }
   uint32_t threads() const override { return q_.threads(); }
   void setJumps(const std::vector<uint64_t>& table) override { jumps_ = q_.buffer(table.size() * 8, table.data()); }
   void writeState(size_t offsetWords, const uint64_t* data, size_t words) override {
-    q_.write(state_, offsetWords * 8, data, words * 8);
+    q_.write(state_[cur_], offsetWords * 8, data, words * 8);
   }
   void readState(size_t offsetWords, uint64_t* data, size_t words) override {
-    q_.read(state_, offsetWords * 8, data, words * 8);
+    q_.read(state_[cur_], offsetWords * 8, data, words * 8);
   }
   void reserveDps(uint32_t entries) override {
     if (entries <= dpCapacity_) return;
     dps_ = q_.buffer(size_t{entries} * gpu::kDpEntryWords * 8);
     dpCapacity_ = entries;
   }
-  uint32_t launch(const std::array<uint64_t, gpu::kKangarooParamWords>& params, std::vector<uint64_t>& dps) override {
-    const uint32_t zero = 0;
+  gpu::LaunchResult launch(const std::array<uint64_t, gpu::kKangarooParamWords>& params,
+                           std::vector<uint64_t>& dps) override {
+    const uint32_t zero[gpu::kCounterWords] = {};
     q_.write(params_, 0, params.data(), sizeof(params));
-    q_.write(dpCount_, 0, &zero, 4);
-    q_.run({&params_, &state_, &jumps_, &dps_, &dpCount_});
-    uint32_t count = 0;
-    q_.read(dpCount_, 0, &count, 4);
-    dps.resize(size_t{std::min<uint64_t>(count, params[3])} * gpu::kDpEntryWords);
+    q_.write(counters_, 0, zero, sizeof(zero));
+    q_.run({&params_, &state_[cur_], &state_[1 - cur_], &jumps_, &dps_, &counters_}, threads());
+    uint32_t counters[gpu::kCounterWords];
+    q_.read(counters_, 0, counters, sizeof(counters));
+    gpu::LaunchResult out;
+    out.count = counters[0];
+    out.finished = counters[1];
+    if (out.finished != threads()) return out;
+    cur_ = 1 - cur_;
+    dps.resize(size_t{std::min<uint64_t>(out.count, params[3])} * gpu::kDpEntryWords);
     if (!dps.empty()) q_.read(dps_, 0, dps.data(), dps.size() * 8);
-    return count;
+    return out;
   }
   std::string label() const override { return q_.label(); }
 
  private:
   ClQueue q_;
-  Mem params_, state_, jumps_, dps_, dpCount_;
+  Mem params_, jumps_, dps_, counters_;
+  Mem state_[2];  // current state_[cur_]; a launch writes the other one
+  int cur_ = 0;
   uint32_t dpCapacity_ = 0;
 };
 
@@ -248,7 +262,8 @@ class OpenClBackend final : public Backend {
       }
       std::vector<cl_platform_id> platforms(np);
       clGetPlatformIDs(np, platforms.data(), nullptr);
-      const std::string source = std::string(kPrelude) + std::string(assets::kOpenCLKernelSource);
+      const std::string source =
+          std::string(kPrelude) + gpu::kernelDefines() + std::string(assets::kOpenCLKernelSource);
       const char* src = source.c_str();
       std::vector<std::string> errors;
       int index = 0;
@@ -275,7 +290,10 @@ class OpenClBackend final : public Backend {
             continue;
           }
           d.program = clCreateProgramWithSource(d.context, 1, &src, nullptr, &err);
-          if (err == CL_SUCCESS) err = clBuildProgram(d.program, 1, &id, "-cl-std=CL1.2", nullptr, nullptr);
+          // Apple GPUs run fe_mul faster than the dedicated fe_sqr (measured, same compiler stack as Metal).
+          const bool apple = deviceString(id, CL_DEVICE_VENDOR).find("Apple") != std::string::npos;
+          const char* options = apple ? "-cl-std=CL1.2 -D FE_SQR_VIA_MUL" : "-cl-std=CL1.2";
+          if (err == CL_SUCCESS) err = clBuildProgram(d.program, 1, &id, options, nullptr, nullptr);
           if (err != CL_SUCCESS) {
             std::string log = d.program ? deviceBuildLog(d.program, id) : "";
             errors.push_back(d.info.name + ": kernel build failed (error " + std::to_string(err) + ")" +

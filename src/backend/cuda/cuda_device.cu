@@ -8,6 +8,11 @@
 
 namespace bsolver::cuda {
 
+static_assert(GPU_GROUP == kScanGroup && SCAN_HIT_CAP == kScanHitCapacity && KPT == kKangaroosPerThread &&
+                  KANG_COMPONENTS == kKangarooComponents && KANG_JUMPS == kKangarooJumps &&
+                  KANG_ESC_JUMPS == kKangarooEscapeJumps && KANG_WINDOW == kKangarooCycleWindow,
+              "kernels.cuh layout constants out of sync with cuda_device.h");
+
 namespace {
 void check(cudaError_t err, const char* what) {
   if (err != cudaSuccess) throw std::runtime_error(std::string("cuda: ") + what + ": " + cudaGetErrorString(err));
@@ -72,21 +77,21 @@ void copyToHost(int device, void* dst, const void* src, size_t bytes) {
 }
 
 void launchScan(int device, uint32_t threads, uint32_t block, const void* params, const void* offsets,
-                const void* gtable, const void* targets, void* hits, void* hitCount) {
+                const void* gtable, const void* targets, void* hits, void* counters) {
   select(device);
   scan_kernel<<<threads / block, block>>>(static_cast<const U64*>(params), static_cast<const U64*>(offsets),
                                           static_cast<const U64*>(gtable), static_cast<const U32*>(targets),
-                                          static_cast<U32*>(hits), static_cast<U32*>(hitCount));
+                                          static_cast<U32*>(hits), static_cast<U32*>(counters));
   check(cudaGetLastError(), "scan_kernel launch");
   check(cudaDeviceSynchronize(), "scan_kernel");
 }
 
-void launchKangaroo(int device, uint32_t threads, uint32_t block, const void* params, void* state, const void* jumps,
-                    void* dps, void* dpCount) {
+void launchKangaroo(int device, uint32_t threads, uint32_t block, const void* params, const void* stateIn,
+                    void* stateOut, const void* jumps, void* dps, void* counters) {
   select(device);
-  kangaroo_kernel<<<threads / block, block>>>(static_cast<const U64*>(params), static_cast<U64*>(state),
-                                              static_cast<const U64*>(jumps), static_cast<U64*>(dps),
-                                              static_cast<U32*>(dpCount));
+  kangaroo_kernel<<<threads / block, block>>>(static_cast<const U64*>(params), static_cast<const U64*>(stateIn),
+                                              static_cast<U64*>(stateOut), static_cast<const U64*>(jumps),
+                                              static_cast<U64*>(dps), static_cast<U32*>(counters));
   check(cudaGetLastError(), "kangaroo_kernel launch");
   check(cudaDeviceSynchronize(), "kangaroo_kernel");
 }

@@ -11,11 +11,9 @@ class Sha256 {
   void update(const uint8_t* data, size_t len);
   void final(uint8_t out[32]);
 
-  // Compresses one 64-byte block into state.
-  static void transform(uint32_t state[8], const uint8_t block[64]);
-  static const uint32_t kInit[8];
-
  private:
+  static void transform(uint32_t state[8], const uint8_t block[64]);
+
   uint32_t s_[8];
   uint8_t buf_[64];
   size_t bufLen_ = 0;

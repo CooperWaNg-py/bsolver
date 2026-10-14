@@ -1,5 +1,6 @@
 #include <memory>
 #include <stdexcept>
+#include <string>
 
 #include "backend/cpu/cpu_scan_worker.h"
 #include "core/gtable.h"
@@ -25,30 +26,81 @@ uint64_t keysBelowTop(const U256& s, uint64_t n) {
   const U256 room = kTopLimit - s;
   return room < U256::fromU64(n) ? room.w[0] : n;
 }
+
+// GPU launches always cover a whole worker segment (not a power of two, and up to 256x its initial size after the
+// iters auto-tune), so the last chunk of each random-order block wastes the rest of a launch; blocks of >= 2^32 keys
+// keep that under a few percent. CPU segments (2^20 keys) divide every block exactly.
+constexpr unsigned kGpuMinBlockBits = 32;
+
+void writePermState(ByteWriter& w, const PermutedSource::State& s) {
+  w.u8(static_cast<uint8_t>(s.blockBits));
+  w.bytes(s.key.data(), s.key.size());
+  w.u256(s.cursor);
+  w.u256(s.keysDone);
+  w.u32(static_cast<uint32_t>(s.pending.size()));
+  for (const PermutedSource::Chunk& c : s.pending) {
+    w.u256(c.pos);
+    w.u64(c.len);
+  }
+}
+
+PermutedSource::State readPermState(ByteReader& r) {
+  PermutedSource::State s;
+  s.blockBits = r.u8();
+  r.bytes(s.key.data(), s.key.size());
+  s.cursor = r.u256();
+  s.keysDone = r.u256();
+  for (uint32_t n = r.u32(); n != 0; --n) {
+    const U256 pos = r.u256();
+    s.pending.push_back({pos, r.u64()});
+  }
+  return s;
+}
+
+std::string blockSummary(const PermutedSource& p) {
+  const U256& n = p.blocks();
+  const std::string count = n.bitLength() <= 64 ? std::to_string(n.w[0]) : "~2^" + std::to_string(n.bitLength() - 1);
+  return "random order: " + count + " blocks of 2^" + std::to_string(p.blockBits()) + " keys";
+}
 }  // namespace
 
-// Payload: sequential `U256 cursor, u64 keysDone` (keysDone = cursor - rangeStart); random `u64 keysDone,
-// U256 prefixCursor` (keys tested, and how far the sequential small-key prefix got).
+// Payload: sequential `U256 cursor, u64 keysDone` (keysDone = cursor - rangeStart). Random: `U256 prefixCursor` (how
+// far the sequential small-key prefix got) and, when the range reaches 2^20, the block permutation state `u8 blockBits,
+// 16-byte key, U256 cursor, U256 keysDone, u32 n, n x (U256 pos, u64 len)` (chunks handed out but not completed).
 bool runScan(RunContext& ctx, Backend& backend) {
   const ResolvedJob& job = ctx.job();
   const bool sequential = job.order == Order::Sequential;
+  const bool gpu = backend.id() != "cpu";
   ScanSetup setup{job.targets, job.addressMode};
+  // Random order visits [blockStart, rangeEnd] as permuted blocks, after the sequential small-key prefix.
+  const U256 blockStart = job.rangeStart < kScanSmallLimit ? kScanSmallLimit : job.rangeStart;
+  const bool hasBlocks = !sequential && !(job.rangeEnd < blockStart);
 
   // Every key in [rangeStart, cursor) is done: the whole range in sequential order, the small-key prefix in random.
   U256 cursor = job.rangeStart;
-  uint64_t keysDone = 0;
+  std::unique_ptr<PermutedSource> perm;
+  U256 blockKeysDone;
   if (ctx.checkpointer().restore([&](ByteReader& r) {
-        if (sequential) cursor = r.u256();
-        keysDone = r.u64();
-        // Random checkpoints written before the prefix cursor existed end here.
-        if (!sequential && r.remaining() != 0) cursor = r.u256();
+        cursor = r.u256();
+        if (sequential) r.u64();  // keysDone, implied by the cursor
         if (cursor < job.rangeStart || job.rangeEnd + 1 < cursor) throw std::runtime_error("cursor out of range");
+        if (hasBlocks) {
+          PermutedSource::State state = readPermState(r);
+          blockKeysDone = state.keysDone;
+          perm = std::make_unique<PermutedSource>(blockStart, job.rangeEnd, std::move(state));
+        }
       })) {
-    ctx.addResumedWork(sequential ? (cursor - job.rangeStart).toDouble() : static_cast<double>(keysDone));
+    ctx.addResumedWork((cursor - job.rangeStart).toDouble() + blockKeysDone.toDouble());
     ctx.setResumed(true);
     ctx.log(LogLevel::Info, "resuming from checkpoint " + ctx.checkpointer().path().string() +
                                 (sequential ? " at " + cursor.toHex() : std::string()));
   }
+  if (hasBlocks && !perm) {
+    const unsigned minBits = gpu ? kGpuMinBlockBits : PermutedSource::kMinBlockBits;
+    perm = std::make_unique<PermutedSource>(blockStart, job.rangeEnd,
+                                            PermutedSource::fresh(job.rangeEnd - blockStart + 1, minBits));
+  }
+  if (perm) ctx.log(LogLevel::Info, blockSummary(*perm));
 
   // Keys below 2^20 never go to the workers (GPU kernels assume no small-key edge cases); keys >= kTopLimit go to a
   // CPU worker instead of a GPU one (see kTopLimit).
@@ -70,16 +122,8 @@ bool runScan(RunContext& ctx, Backend& backend) {
     prefixDone = prefixEnd < cursor;
   }
 
-  const U256 mainStart =
-      sequential ? cursor : (job.rangeStart < kScanSmallLimit ? kScanSmallLimit : job.rangeStart);
   std::unique_ptr<SequentialSource> seq;
-  std::unique_ptr<RandomSource> rnd;
-  if (sequential) {
-    seq = std::make_unique<SequentialSource>(mainStart, job.rangeEnd, mainStart);
-  } else if (!(job.rangeEnd < mainStart)) {
-    rnd = std::make_unique<RandomSource>(mainStart, job.rangeEnd);
-  }
-
+  if (sequential) seq = std::make_unique<SequentialSource>(cursor, job.rangeEnd, cursor);
   SnapshotScope snapshot(ctx.checkpointer(), [&] {
     ByteWriter w;
     if (sequential) {
@@ -90,15 +134,14 @@ bool runScan(RunContext& ctx, Backend& backend) {
       w.u256(resume);
       w.u64(done.bitLength() > 64 ? UINT64_MAX : done.w[0]);
     } else {
-      w.u64(static_cast<uint64_t>(ctx.workDone()));
       w.u256(cursor);
+      if (perm) writePermState(w, perm->snapshot());
     }
     return std::move(w.data());
   });
 
-  if (!ctx.shouldStop() && ((seq && !seq->finished()) || rnd)) {
+  if (!ctx.shouldStop() && (seq ? !seq->finished() : perm && !perm->finished())) {
     auto workers = backend.createScanWorkers(setup, ctx.spec().devices, ctx.spec().threads);
-    const bool clipTop = backend.id() != "cpu";
     if (workers.empty()) throw std::runtime_error("backend " + std::string(backend.id()) + " created no workers");
     runThreads(ctx, workers.size(), [&](size_t i) {
       ScanWorker* w = workers[i].get();
@@ -110,10 +153,10 @@ bool runScan(RunContext& ctx, Backend& backend) {
           if (ctx.shouldStop()) break;
           U256 s;
           uint64_t n = 0;
-          bool ok = seq ? seq->next(w->segmentKeys(), &s, &n) : rnd->next(w->segmentKeys(), &s, &n);
+          bool ok = seq ? seq->next(w->segmentKeys(), &s, &n) : perm->next(w->segmentKeys(), &s, &n);
           if (!ok) break;
           candidates.clear();
-          const uint64_t below = clipTop ? keysBelowTop(s, n) : n;
+          const uint64_t below = gpu ? keysBelowTop(s, n) : n;
           if (below != 0) w->process(s, below, candidates);
           if (below < n) {
             if (!topWorker) topWorker = makeCpuScanWorker(setup, 0);
@@ -124,7 +167,11 @@ bool runScan(RunContext& ctx, Backend& backend) {
             }
           }
           verifyCandidates(ctx, candidates);
-          if (seq) seq->complete(s);
+          if (seq) {
+            seq->complete(s);
+          } else {
+            perm->complete(s);
+          }
           ctx.addWork(static_cast<double>(n));
         }
       } catch (const std::exception& ex) {
@@ -133,8 +180,7 @@ bool runScan(RunContext& ctx, Backend& backend) {
     });
   }
 
-  // Random order is exhausted only when the small-key prefix covered the whole range.
-  bool exhausted = seq ? seq->finished() : (!rnd && prefixDone);
+  bool exhausted = seq ? seq->finished() : prefixDone && (!perm || perm->finished());
   // Without stopOnFound the job's purpose is the whole range, so a stop keeps the checkpoint.
   snapshot.finish(exhausted || (ctx.spec().stopOnFound && ctx.allFound()));
   return exhausted;

@@ -44,6 +44,7 @@ include(Embed)
 include(Backends)
 include(WebUI)
 include(Https)
+include(CpuHash)
 
 file(GLOB_RECURSE BSOLVER_CORE_SOURCES CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/src/core/*.cpp
@@ -56,6 +57,8 @@ file(GLOB_RECURSE BSOLVER_CORE_SOURCES CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/src/pool/*.cpp)
 # Toolkit-specific backends are added by cmake/Backends.cmake only when their toolkit is found.
 list(FILTER BSOLVER_CORE_SOURCES EXCLUDE REGEX "/src/backend/(opencl|metal|cuda)/")
+# Instruction-set-specific hash variants are added by cmake/CpuHash.cmake only when the compiler supports them.
+list(FILTER BSOLVER_CORE_SOURCES EXCLUDE REGEX "/src/core/hash_batch_[a-z0-9]+\\.cpp$")
 
 bsolver_embed(OUTPUT ${CMAKE_BINARY_DIR}/generated/catalog_data.cpp
   SYMBOL PuzzleCatalogJson MODE text
@@ -65,7 +68,8 @@ add_library(bsolver_core STATIC
   ${BSOLVER_CORE_SOURCES}
   ${CMAKE_BINARY_DIR}/generated/catalog_data.cpp
   ${BSOLVER_WEBUI_ASSETS_CPP}
-  ${BSOLVER_BACKEND_SOURCES})
+  ${BSOLVER_BACKEND_SOURCES}
+  ${BSOLVER_HASH_SOURCES})
 target_include_directories(bsolver_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_definitions(bsolver_core PUBLIC
   BSOLVER_VERSION="${PROJECT_VERSION}"

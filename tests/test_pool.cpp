@@ -521,8 +521,9 @@ TEST_CASE("pool session records keys that do not belong to its assignment like a
 
 TEST_CASE("pool session resumes an interrupted range") {
   if (!httpsSupported()) SKIP("built without an HTTP client");
-  // 2^25 keys: long enough to interrupt; three proof keys near the start, three at the end.
-  MockPool mock("1FFFFFF", {100, 2000, 30000, 0x1FFFFFE, 0x1FFFF00, 0x1000000}, 0x1FFFFFF);
+  // 2^28 keys: the resumed remainder must outlast the 1 s ping interval even with the batched CPU hashing on many
+  // cores. Three proof keys near the start (so the first run can be interrupted early), the others further on.
+  MockPool mock("FFFFFFF", {100, 2000, 30000, 0xFFFFFFE, 0xFFFFF00, 0x8000000}, 0xFFFFFFF);
   TempDir dir;
   const ManagerOptions mopts{dir.path / "state", dir.path / "found.jsonl"};
   const fs::path statePath = poolStatePath(mopts.stateDir, 38);

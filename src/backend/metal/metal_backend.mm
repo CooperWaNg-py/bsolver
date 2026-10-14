@@ -17,6 +17,7 @@
 namespace bsolver {
 
 namespace {
+// fe_sqr as fe_mul: Apple GPUs run the 4x64 multiply faster than the dedicated squaring (measured).
 constexpr const char* kPrelude =
     "#include <metal_stdlib>\n"
     "using namespace metal;\n"
@@ -27,7 +28,8 @@ constexpr const char* kPrelude =
     "#define MULHI64(a, b) mulhi((ulong)(a), (ulong)(b))\n"
     "#define U64 ulong\n"
     "#define U32 uint\n"
-    "#define ATOMIC_INC(p) atomic_fetch_add_explicit((device atomic_uint*)(p), 1u, memory_order_relaxed)\n";
+    "#define ATOMIC_INC(p) atomic_fetch_add_explicit((device atomic_uint*)(p), 1u, memory_order_relaxed)\n"
+    "#define FE_SQR_VIA_MUL\n";
 
 // Metal has no compute-unit query. Apple GPUs publish their core count as "gpu-core-count" in the
 // IORegistry entry of the accelerator; other GPUs (or a missing entry) fall back to 8.
@@ -71,6 +73,7 @@ class MtlQueue {
   }
 
   uint32_t threads() const { return threads_; }
+  uint32_t group() const { return group_; }
   std::string label() const { return "metal#" + std::to_string(dev_.info.index); }
 
   id<MTLBuffer> buffer(size_t bytes, const void* init = nullptr) {
@@ -80,21 +83,23 @@ class MtlQueue {
     return b;
   }
 
-  // Binds the buffers at indices 0..n-1, runs threads() threads and waits.
-  void run(std::initializer_list<id<MTLBuffer>> args) {
+  // Binds the buffers at indices 0..n-1, runs `count` threads (a multiple of group()) and waits. Returns the command
+  // buffer's error (empty on success).
+  std::string run(std::initializer_list<id<MTLBuffer>> args, uint32_t count) {
     @autoreleasepool {
       id<MTLCommandBuffer> cb = [queue_ commandBuffer];
       id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
       [enc setComputePipelineState:pipeline_];
       NSUInteger i = 0;
       for (id<MTLBuffer> b : args) [enc setBuffer:b offset:0 atIndex:i++];
-      [enc dispatchThreadgroups:MTLSizeMake(threads_ / group_, 1, 1) threadsPerThreadgroup:MTLSizeMake(group_, 1, 1)];
+      [enc dispatchThreadgroups:MTLSizeMake(count / group_, 1, 1) threadsPerThreadgroup:MTLSizeMake(group_, 1, 1)];
       [enc endEncoding];
       [cb commit];
       [cb waitUntilCompleted];
       if (cb.status == MTLCommandBufferStatusError) {
-        throw std::runtime_error("metal: command buffer failed: " + nsString(cb.error.localizedDescription));
+        return "metal: command buffer failed: " + nsString(cb.error.localizedDescription);
       }
+      return {};
     }
   }
 
@@ -115,9 +120,10 @@ class MtlScanKernel final : public gpu::ScanKernel {
   explicit MtlScanKernel(const MtlDevice& dev) : q_(dev, dev.scan) {
     params_ = q_.buffer(gpu::kScanParamWords * 8);
     hits_ = q_.buffer(gpu::kHitCapacity * sizeof(gpu::ScanHit));
-    hitCount_ = q_.buffer(4);
+    counters_ = q_.buffer(gpu::kCounterWords * 4);
   }
   uint32_t threads() const override { return q_.threads(); }
+  uint32_t groupSize() const override { return q_.group(); }
   void setTables(const std::vector<uint64_t>& gTable, const std::vector<uint32_t>& targets) override {
     gTable_ = q_.buffer(gTable.size() * 8, gTable.data());
     targets_ = q_.buffer(targets.size() * 4, targets.data());
@@ -125,56 +131,68 @@ class MtlScanKernel final : public gpu::ScanKernel {
   void setOffsets(const std::vector<uint64_t>& offsets) override {
     offsets_ = q_.buffer(offsets.size() * 8, offsets.data());
   }
-  uint32_t launch(const std::array<uint64_t, gpu::kScanParamWords>& params, std::vector<gpu::ScanHit>& hits) override {
+  gpu::LaunchResult launch(const std::array<uint64_t, gpu::kScanParamWords>& params, uint32_t count,
+                           std::vector<gpu::ScanHit>& hits) override {
     std::memcpy(params_.contents, params.data(), sizeof(params));
-    *contents<uint32_t>(hitCount_) = 0;
-    q_.run({params_, offsets_, gTable_, targets_, hits_, hitCount_});
-    uint32_t count = *contents<uint32_t>(hitCount_);
+    uint32_t* counters = contents<uint32_t>(counters_);
+    std::fill(counters, counters + gpu::kCounterWords, 0u);
+    gpu::LaunchResult out;
+    out.error = q_.run({params_, offsets_, gTable_, targets_, hits_, counters_}, count);
+    out.count = counters[0];
+    out.finished = counters[1];
     const auto* h = contents<gpu::ScanHit>(hits_);
-    hits.assign(h, h + std::min(count, gpu::kHitCapacity));
-    return count;
+    hits.assign(h, h + std::min(out.count, gpu::kHitCapacity));
+    return out;
   }
   std::string label() const override { return q_.label(); }
 
  private:
   MtlQueue q_;
-  id<MTLBuffer> params_, offsets_, gTable_, targets_, hits_, hitCount_;
+  id<MTLBuffer> params_, offsets_, gTable_, targets_, hits_, counters_;
 };
 
 class MtlKangarooKernel final : public gpu::KangarooKernel {
  public:
   explicit MtlKangarooKernel(const MtlDevice& dev) : q_(dev, dev.kangaroo) {
     params_ = q_.buffer(gpu::kKangarooParamWords * 8);
-    state_ = q_.buffer(gpu::kStateComponents * size_t{threads()} * gpu::kKangaroosPerThread * 8);
-    dpCount_ = q_.buffer(4);
+    for (auto& s : state_) s = q_.buffer(gpu::kangarooStateWords(threads()) * 8);
+    counters_ = q_.buffer(gpu::kCounterWords * 4);
   }
   uint32_t threads() const override { return q_.threads(); }
   void setJumps(const std::vector<uint64_t>& table) override { jumps_ = q_.buffer(table.size() * 8, table.data()); }
   void writeState(size_t offsetWords, const uint64_t* data, size_t words) override {
-    std::memcpy(contents<uint64_t>(state_) + offsetWords, data, words * 8);
+    std::memcpy(contents<uint64_t>(state_[cur_]) + offsetWords, data, words * 8);
   }
   void readState(size_t offsetWords, uint64_t* data, size_t words) override {
-    std::memcpy(data, contents<uint64_t>(state_) + offsetWords, words * 8);
+    std::memcpy(data, contents<uint64_t>(state_[cur_]) + offsetWords, words * 8);
   }
   void reserveDps(uint32_t entries) override {
     if (entries <= dpCapacity_) return;
     dps_ = q_.buffer(size_t{entries} * gpu::kDpEntryWords * 8);
     dpCapacity_ = entries;
   }
-  uint32_t launch(const std::array<uint64_t, gpu::kKangarooParamWords>& params, std::vector<uint64_t>& dps) override {
+  gpu::LaunchResult launch(const std::array<uint64_t, gpu::kKangarooParamWords>& params,
+                           std::vector<uint64_t>& dps) override {
     std::memcpy(params_.contents, params.data(), sizeof(params));
-    *contents<uint32_t>(dpCount_) = 0;
-    q_.run({params_, state_, jumps_, dps_, dpCount_});
-    uint32_t count = *contents<uint32_t>(dpCount_);
+    uint32_t* counters = contents<uint32_t>(counters_);
+    std::fill(counters, counters + gpu::kCounterWords, 0u);
+    gpu::LaunchResult out;
+    out.error = q_.run({params_, state_[cur_], state_[1 - cur_], jumps_, dps_, counters_}, threads());
+    out.count = counters[0];
+    out.finished = counters[1];
+    if (!out.error.empty() || out.finished != threads()) return out;
+    cur_ = 1 - cur_;
     const uint64_t* d = contents<uint64_t>(dps_);
-    dps.assign(d, d + size_t{std::min<uint64_t>(count, params[3])} * gpu::kDpEntryWords);
-    return count;
+    dps.assign(d, d + size_t{std::min<uint64_t>(out.count, params[3])} * gpu::kDpEntryWords);
+    return out;
   }
   std::string label() const override { return q_.label(); }
 
  private:
   MtlQueue q_;
-  id<MTLBuffer> params_, state_, jumps_, dps_, dpCount_;
+  id<MTLBuffer> params_, jumps_, dps_, counters_;
+  id<MTLBuffer> state_[2];  // current state_[cur_]; a launch writes the other one
+  int cur_ = 0;
   uint32_t dpCapacity_ = 0;
 };
 
@@ -200,7 +218,7 @@ std::vector<MtlDevice> loadDevices(std::string* reason) {
       *reason = "no Metal devices";
       return out;
     }
-    const std::string source = std::string(kPrelude) + std::string(assets::kMetalKernelSource);
+    const std::string source = std::string(kPrelude) + gpu::kernelDefines() + std::string(assets::kMetalKernelSource);
     NSString* src = [NSString stringWithUTF8String:source.c_str()];
     std::vector<std::string> errors;
     int index = 0;

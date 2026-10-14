@@ -102,6 +102,8 @@ std::vector<KangarooParams> layoutHerd(const KangarooParams& params,
   return out;
 }
 
+// A random Q in a 2^40 interval with dp 8: one step must yield DPs and states that satisfy the walk invariant
+// (tame point == dist*G, wild point == wildBase + dist*G, type by global index).
 void checkKangaroo(Backend& b, const BenchOptions& opt) {
   auto workers = b.createKangarooWorkers(opt.devices, opt.threads);
   if (workers.empty()) throw std::runtime_error("no workers");
@@ -109,24 +111,25 @@ void checkKangaroo(Backend& b, const BenchOptions& opt) {
   const U256 width = U256::fromU64(1) << 40;
   const U256 a = width;
   const Affine q = mulG(a + rng.uniform(U256{}, width - 1));
-  const Affine wildBase = wildBaseFor(q, a);
-  auto params =
-      layoutHerd(makeKangarooParams(width, wildBase, 8, makeJumpDistances(width, totalKangaroos(workers), rng)), workers);
+  const Affine wildBase = wildBaseFor(q, a, kangarooShift(width));
+  auto params = layoutHerd(makeKangarooParams(width, wildBase, 8, makeJumpDistances(width, rng)), workers);
   forEachConcurrently(workers.size(), nullptr, [&](size_t i) {
     KangarooWorker& w = *workers[i];
-    w.init(params[i], 0x5eed0000 + i);
+    const uint64_t first = params[i].firstKangaroo;
+    w.init(params[i], 0x5eed0000 + i, {});
     std::vector<Dp> dps;
     w.step(dps);
     for (size_t k = 0; k < std::min<size_t>(dps.size(), 16); ++k) {
-      if (!verifyKangarooPoint(dps[k].x, dps[k].dist, dps[k].wild, wildBase)) {
+      if (dps[k].wild != isWildKangaroo(first + dps[k].index) ||
+          !verifyKangarooPoint(dps[k].x, dps[k].dist, dps[k].wild, wildBase)) {
         throw std::runtime_error(w.label() + ": correctness check failed (invalid distinguished point)");
       }
     }
     auto sample = w.sample(16);
     for (size_t k = 0; k < sample.size(); ++k) {
-      bool wild = k % 2 == 1;
-      Affine expect = wild ? add(wildBase, mulG(sample[k].second)) : mulG(sample[k].second);
-      if (!(expect == sample[k].first)) {
+      Affine expect = mulG(signedToScalar(sample[k].dist));
+      if (isWildKangaroo(first + k)) expect = add(wildBase, expect);
+      if (!(expect == sample[k].point)) {
         throw std::runtime_error(w.label() + ": correctness check failed (kangaroo state mismatch)");
       }
     }
@@ -139,15 +142,16 @@ double kangarooThroughput(Backend& b, const BenchOptions& opt) {
   const U256 width = U256::fromU64(1) << 100;
   const U256 a = width;
   const Affine q = mulG(a + rng.uniform(U256{}, width - 1));
-  auto params = layoutHerd(makeKangarooParams(width, wildBaseFor(q, a), autoDpBits(width),
-                                              makeJumpDistances(width, totalKangaroos(workers), rng)),
+  auto params = layoutHerd(makeKangarooParams(width, wildBaseFor(q, a, kangarooShift(width)),
+                                              autoDpBits(width, totalKangaroos(workers)),
+                                              makeJumpDistances(width, rng)),
                            workers);
   const uint64_t seed = rng.next();
   std::vector<double> rates(workers.size(), 0);
   std::atomic<bool> stop{false};
   forEachConcurrently(workers.size(), &stop, [&](size_t i) {
     KangarooWorker& w = *workers[i];
-    w.init(params[i], seed + i);
+    w.init(params[i], seed + i, {});
     std::vector<Dp> dps;
     w.step(dps);  // warm-up
     double jumps = 0;

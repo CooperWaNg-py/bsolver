@@ -1,7 +1,10 @@
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 
@@ -20,6 +23,8 @@ using Clock = std::chrono::steady_clock;
 
 constexpr auto kInvalidDpWarnInterval = std::chrono::minutes(1);
 constexpr size_t kVerifyChunk = 512;
+// DP overhead ratio nK*2^dp/sqrt(W) above which the run is noticeably slowed (+35% of the 1.15*sqrt(W) walk).
+constexpr long double kHighDpOverhead = 0.5L;
 
 // Marks valid[i] for each DP whose x matches dist*G (tame) or wildBase + dist*G (wild). One batch inversion per
 // chunk; large batches are spread over the hardware threads (GPU workers can return hundreds of thousands).
@@ -34,7 +39,8 @@ void verifyDps(RunContext& ctx, const std::vector<Dp>& dps, const Affine& wildBa
       aff.resize(n);
       for (size_t i = 0; i < n; ++i) {
         const Dp& d = dps[c + i];
-        jac[i] = d.wild ? jacAddMixed(mulGJacobian(d.dist), wildBase) : mulGJacobian(d.dist);
+        jac[i] = mulGJacobian(signedToScalar(d.dist));
+        if (d.wild) jac[i] = jacAddMixed(jac[i], wildBase);
       }
       batchToAffine(jac.data(), aff.data(), n);
       for (size_t i = 0; i < n; ++i) valid[c + i] = !aff[i].inf && aff[i].x.toU256() == dps[c + i].x;
@@ -52,26 +58,91 @@ void verifyDps(RunContext& ctx, const std::vector<Dp>& dps, const Affine& wildBa
   });
 }
 
-// Tame/wild collision on x: T = W gives k' = tDist - wDist, T = -W gives k' = -(tDist + wDist) (mod n).
-bool solveCollision(RunContext& ctx, const U256& tameDist, const U256& wildDist) {
-  const U256& a = ctx.job().rangeStart;
-  const U256 t = reduceMod(tameDist), w = reduceMod(wildDist);
-  for (const U256& key : {addMod(a, subMod(t, w)), addMod(a, negMod(addMod(t, w)))}) {
-    Affine p = mulG(key);
-    if (p == *ctx.job().pubkey) return ctx.reportFound(key, p);
+// Kangaroo states handed from the worker threads to the checkpoint snapshot, which must not touch the workers
+// itself (GPU state can only be read between launches by the thread that launches). A snapshot raises the
+// generation and waits until every worker has deposited its states after a step, or is idle (paused, finished
+// or never started) with its last deposit.
+class StateStage {
+ public:
+  explicit StateStage(size_t workers) : slots_(workers) {}
+
+  // Worker thread i, between steps: deposits the states if a snapshot is waiting.
+  void serve(size_t i, KangarooWorker& w) {
+    const uint64_t g = generation_.load();
+    if (g == slots_[i].servedLocal) return;
+    slots_[i].servedLocal = g;
+    deposit(i, w.sample(w.kangarooCount()), g, false);
   }
-  return false;
+  // Worker thread i before blocking or exiting: deposits the current states and marks the slot idle.
+  void park(size_t i, KangarooWorker& w) { deposit(i, w.sample(w.kangarooCount()), generation_.load(), true); }
+  void unpark(size_t i) {
+    std::lock_guard<std::mutex> lock(mu_);
+    slots_[i].idle = false;
+  }
+  // All workers are gone: snapshots stop waiting.
+  void close() {
+    std::lock_guard<std::mutex> lock(mu_);
+    closed_ = true;
+    cv_.notify_all();
+  }
+
+  // States of all workers in global order, or empty when some worker never deposited.
+  std::vector<KangarooState> collect() {
+    const uint64_t g = ++generation_;
+    std::unique_lock<std::mutex> lock(mu_);
+    cv_.wait(lock, [&] {
+      return closed_ || std::all_of(slots_.begin(), slots_.end(), [&](const Slot& s) { return s.idle || s.served >= g; });
+    });
+    std::vector<KangarooState> out;
+    for (const Slot& s : slots_) {
+      if (!s.valid) return {};
+      out.insert(out.end(), s.states.begin(), s.states.end());
+    }
+    return out;
+  }
+
+ private:
+  struct Slot {
+    uint64_t servedLocal = 0;  // worker thread only
+    uint64_t served = 0;
+    bool idle = false, valid = false;
+    std::vector<KangarooState> states;
+  };
+
+  void deposit(size_t i, std::vector<KangarooState> states, uint64_t g, bool idle) {
+    std::lock_guard<std::mutex> lock(mu_);
+    Slot& s = slots_[i];
+    s.states = std::move(states);
+    s.valid = true;
+    s.served = std::max(s.served, g);
+    s.idle = idle;
+    cv_.notify_all();
+  }
+
+  std::mutex mu_;
+  std::condition_variable cv_;
+  std::atomic<uint64_t> generation_{0};
+  std::vector<Slot> slots_;
+  bool closed_ = false;
+};
+
+std::string fmt2(long double v) {
+  char buf[32];
+  std::snprintf(buf, sizeof buf, "%.2Lf", v);
+  return buf;
 }
 }  // namespace
 
 void runKangaroo(RunContext& ctx, Backend& backend) {
   const ResolvedJob& job = ctx.job();
   if (!job.pubkey) throw std::runtime_error("algorithm kangaroo requires a public key");
+  const Affine& q = *job.pubkey;
   const U256 width = job.width();
-  const Affine wildBase = wildBaseFor(*job.pubkey, job.rangeStart);
+  const U256 shift = kangarooShift(width);
+  const Affine wildBase = wildBaseFor(q, job.rangeStart, shift);
   if (wildBase.inf) {
-    // Q == a*G: no walk needed (and the wild herd would start at infinity).
-    ctx.reportFound(job.rangeStart, *job.pubkey);
+    // Q == (a - shift)*G: no walk needed (and the wild herd would start at infinity).
+    ctx.reportFound(kangarooKey(job.rangeStart, shift, U256{}), q);
     return;
   }
 
@@ -85,92 +156,122 @@ void runKangaroo(RunContext& ctx, Backend& backend) {
   }
 
   KangarooTable table;
-  uint32_t dpBits = 0;
-  std::array<U256, 64> jumpDist;
+  KangarooCheckpoint header;
+  std::vector<KangarooState> saved;
   Rng rng;
-  uint64_t resumedJumps = 0;
-  if (ctx.checkpointer().restore([&](ByteReader& r) {
-        dpBits = r.u32();
-        if (dpBits > kMaxDpBits) throw std::runtime_error("dp bits out of range");
-        for (auto& d : jumpDist) d = r.u256();
-        resumedJumps = r.u64();
-        uint64_t count = r.u64();
-        for (uint64_t i = 0; i < count; ++i) {
-          X128 x;
-          x.lo = r.u64();
-          x.hi = r.u64();
-          U256 dist = r.u256();
-          bool wild = r.u8() != 0;
-          table.insert(x, {dist, wild});
-        }
-      })) {
-    ctx.addResumedWork(static_cast<double>(resumedJumps));
+  const bool restored =
+      ctx.checkpointer().restore([&](ByteReader& r) { header = readKangarooCheckpoint(r, table, saved); });
+  const std::optional<uint32_t> userDp = ctx.spec().dpBits;
+  if (restored) {
+    ctx.addResumedWork(static_cast<double>(header.jumps));
     ctx.setResumed(true);
     ctx.log(LogLevel::Info, "resuming from checkpoint " + ctx.checkpointer().path().string() + ": " +
                                 std::to_string(table.size()) + " distinguished points, " +
-                                std::to_string(resumedJumps) + " jumps");
-    if (ctx.spec().dpBits && *ctx.spec().dpBits != dpBits) {
-      ctx.log(LogLevel::Info, "using dp " + std::to_string(dpBits) + " from the checkpoint");
+                                std::to_string(saved.size()) + " kangaroo states, " + std::to_string(header.jumps) +
+                                " jumps");
+    // Kangaroo states carry the walks across runs, so the dp may change: the stored DPs remain valid points.
+    const uint64_t design = std::max<uint64_t>(header.designKangaroos, 1);
+    const bool mismatch = nK > 2 * design || design > 2 * nK;
+    if (userDp && *userDp != header.dpBits) {
+      ctx.log(LogLevel::Info, "dp " + std::to_string(header.dpBits) + " from the checkpoint replaced by --dp " +
+                                  std::to_string(*userDp));
+      header.dpBits = *userDp;
+      header.designKangaroos = nK;
+    } else if (!userDp && mismatch) {
+      const uint32_t dp = autoDpBits(width, nK);
+      ctx.log(LogLevel::Warn, "checkpoint dp " + std::to_string(header.dpBits) + " was chosen for " +
+                                  std::to_string(design) + " kangaroos, resuming with " + std::to_string(nK) +
+                                  "; using dp " + std::to_string(dp));
+      header.dpBits = dp;
+      header.designKangaroos = nK;
+    }
+    if (saved.size() != nK) {
+      ctx.log(LogLevel::Info, "checkpoint holds " + std::to_string(saved.size()) + " kangaroo states for " +
+                                  std::to_string(nK) + " kangaroos; " +
+                                  (saved.size() > nK ? "dropping the rest" : "starting the rest fresh"));
+      if (saved.size() > nK) saved.resize(nK);
     }
   } else {
-    dpBits = ctx.spec().dpBits.value_or(autoDpBits(width));
-    jumpDist = makeJumpDistances(width, nK, rng);
+    header.dpBits = userDp.value_or(autoDpBits(width, nK));
+    header.designKangaroos = nK;
+    header.dist = makeJumpDistances(width, rng);
   }
+  const uint32_t dpBits = header.dpBits;
 
-  const long double overhead = static_cast<long double>(nK) * std::ldexp(1.0L, static_cast<int>(dpBits));
-  if (overhead > std::sqrt(width.toLongDouble()) / 2) {
-    ctx.log(LogLevel::Warn, "dp overhead high; consider lower --dp");
-  }
+  const long double ratio = static_cast<long double>(nK) * std::ldexp(1.0L, static_cast<int>(dpBits)) /
+                            std::sqrt(width.toLongDouble());
+  if (ratio > kHighDpOverhead) ctx.log(LogLevel::Warn, "dp overhead high; consider lower --dp");
   const double expected = kangarooExpectedWork(width, nK, dpBits);
   ctx.setWorkExpected(expected);
-  char expectedBits[16];
-  std::snprintf(expectedBits, sizeof expectedBits, "%.2f", std::log2(expected));
-  ctx.log(LogLevel::Info, "kangaroo: " + std::to_string(nK) + " kangaroos on " + std::to_string(workers.size()) +
-                              " workers, dp " + std::to_string(dpBits) + ", expected 2^" + expectedBits + " jumps");
+  ctx.log(LogLevel::Info, "kangaroo (symmetric): " + std::to_string(nK) + " kangaroos on " +
+                              std::to_string(workers.size()) + " workers, dp " + std::to_string(dpBits) +
+                              " (overhead ratio " + fmt2(ratio) + "), expected 2^" + fmt2(std::log2(expected)) +
+                              " jumps");
 
-  KangarooParams params = makeKangarooParams(width, wildBase, dpBits, jumpDist);
+  KangarooParams params = makeKangarooParams(width, wildBase, dpBits, header.dist);
   params.totalKangaroos = nK;
+  if (!saved.empty()) restoreKangarooPoints(params, saved, rng.next());
 
+  StateStage stage(workers.size());
   SnapshotScope snapshot(ctx.checkpointer(), [&] {
-    constexpr size_t kEntryBytes = 16 + 32 + 1;
-    ByteWriter w;
-    // Entries inserted while visiting only grow the buffer; the count is patched in afterwards.
-    w.reserve(4 + 64 * 32 + 8 + 8 + table.size() * kEntryBytes);
-    w.u32(dpBits);
-    for (const U256& d : jumpDist) w.u256(d);
-    w.u64(static_cast<uint64_t>(ctx.workDone()));
-    const size_t countPos = w.size();
-    w.u64(0);
-    uint64_t count = 0;
-    table.forEach([&](const X128& x, const KangarooTable::Entry& e) {
-      w.u64(x.lo);
-      w.u64(x.hi);
-      w.u256(e.dist);
-      w.u8(e.wild ? 1 : 0);
-      ++count;
-    });
-    w.patchU64(countPos, count);
-    return std::move(w.data());
+    // Workers add their jumps before depositing, so parked (paused/finished) workers match the count exactly.
+    const std::vector<KangarooState> states = stage.collect();
+    KangarooCheckpoint h = header;
+    h.jumps = static_cast<uint64_t>(ctx.workDone());
+    return writeKangarooCheckpoint(h, table, states);
   });
 
   const bool verify = backend.id() != "cpu";
+  const U256& a = job.rangeStart;
   auto done = [&] { return ctx.shouldStop() || ctx.anyFound(); };
+  auto solve = [&](const KangarooTable::Entry& e1, const KangarooTable::Entry& e2) {
+    for (const U256& k : collisionCandidates(e1.wild, e1.dist, e2.wild, e2.dist)) {
+      const U256 key = kangarooKey(a, shift, k);
+      Affine p = mulG(key);
+      if (p == q) return ctx.reportFound(key, p);
+    }
+    return false;
+  };
   std::vector<uint64_t> seeds(workers.size());
   for (auto& s : seeds) s = rng.next();
+  struct CloseStage {
+    StateStage& s;
+    ~CloseStage() { s.close(); }
+  } closeStage{stage};
   runThreads(ctx, workers.size(), [&](size_t i) {
     KangarooWorker& w = *workers[i];
     try {
+      struct Park {
+        StateStage& stage;
+        KangarooWorker& w;
+        size_t i;
+        bool initialized = false;
+        ~Park() {
+          if (!initialized) return;
+          try {
+            stage.park(i, w);
+          } catch (...) {
+          }
+        }
+      } park{stage, w, i};
       KangarooParams p = params;
       p.firstKangaroo = firstIndex[i];
-      w.init(p, seeds[i]);
+      const size_t begin = std::min<size_t>(firstIndex[i], saved.size());
+      const size_t end = std::min<size_t>(firstIndex[i] + w.kangarooCount(), saved.size());
+      w.init(p, seeds[i], std::vector<KangarooState>(saved.begin() + begin, saved.begin() + end));
+      park.initialized = true;
       Rng resetRng(seeds[i] ^ 0x5851f42d4c957f2dULL);
       std::vector<Dp> dps;
       std::vector<uint8_t> valid;
       uint64_t invalid = 0;
       std::optional<Clock::time_point> lastWarn;
       while (!done()) {
-        ctx.waitIfPaused();
-        if (done()) break;
+        if (ctx.paused()) {
+          stage.park(i, w);
+          ctx.waitIfPaused();
+          stage.unpark(i);
+          continue;
+        }
         dps.clear();
         ctx.addWork(static_cast<double>(w.step(dps)));
         if (verify) verifyDps(ctx, dps, wildBase, valid);
@@ -180,14 +281,17 @@ void runKangaroo(RunContext& ctx, Backend& backend) {
             ++invalid;
             continue;
           }
-          auto existing = table.insert(X128::of(d.x), {d.dist, d.wild});
+          const KangarooTable::Entry entry{signedToScalar(d.dist), d.wild};
+          auto existing = table.insert(X128::of(d.x), entry);
           if (!existing) continue;
-          if (existing->wild == d.wild) {
+          if (collisionCandidates(existing->wild, existing->dist, entry.wild, entry.dist).empty()) {
+            // Tame-tame or a merged wild-wild pair: the newcomer walks a known trail.
             w.reset(d.index, resetRng.next());
-          } else if (!solveCollision(ctx, d.wild ? existing->dist : d.dist, d.wild ? d.dist : existing->dist)) {
+          } else if (!solve(*existing, entry)) {
             ctx.log(LogLevel::Warn, "false collision");
           }
         }
+        stage.serve(i, w);
         auto now = Clock::now();
         if (invalid > 0 && (!lastWarn || now - *lastWarn >= kInvalidDpWarnInterval)) {
           ctx.log(LogLevel::Warn, "discarded " + std::to_string(invalid) + " invalid DPs from " + w.label());

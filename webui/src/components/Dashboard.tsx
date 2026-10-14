@@ -39,13 +39,7 @@ export function Dashboard({ status, rates, logs, onStatus }: Props) {
   const canPause = s.state === 'running';
   const canResume = s.state === 'paused';
   const canStop = s.state === 'benchmarking' || s.state === 'running' || s.state === 'paused';
-  const timeLabel = s.etaSeconds !== null ? 'ETA' : 'Expected time';
-  const timeValue =
-    s.etaSeconds !== null
-      ? formatDuration(s.etaSeconds)
-      : s.workExpected !== null && s.rate > 0
-        ? formatDuration(s.workExpected / s.rate)
-        : '—';
+  const eta = s.etaSeconds !== null ? formatDuration(s.etaSeconds) : '—';
   const algorithm = s.algorithm ? (s.order ? `${s.algorithm} (${s.order})` : s.algorithm) : '—';
 
   return (
@@ -105,8 +99,8 @@ export function Dashboard({ status, rates, logs, onStatus }: Props) {
             </dd>
           </div>
           <div>
-            <dt>{timeLabel}</dt>
-            <dd>{timeValue}</dd>
+            <dt>ETA</dt>
+            <dd>{eta}</dd>
           </div>
           <div>
             <dt>Elapsed</dt>

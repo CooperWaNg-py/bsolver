@@ -318,19 +318,11 @@ JobStatus JobManager::statusLocked() const {
   s.rate = job_->rate;
   const double expected = ctx.workExpected();
   const Algo algo = job_->resolved.algorithm;
-  if (expected > 0) s.workExpected = expected;
-  if (algo == Algo::Scan && job_->resolved.order == Order::Random) {
-    // Random scan: no progress/ETA; the UI shows workExpected/rate as the expected time.
-  } else if (expected > 0) {
-    double remaining = expected - s.workDone;
-    if (algo == Algo::Kangaroo) {
-      s.progress = s.workDone / expected;
-      remaining = std::max(0.0, remaining);
-    } else {
-      s.progress = std::min(1.0, s.workDone / expected);
-      remaining = std::max(0.0, remaining);
-    }
-    if (s.rate > 0 && isActive(s.state)) s.etaSeconds = remaining / s.rate;
+  if (expected > 0) {
+    s.workExpected = expected;
+    // Kangaroo progress may exceed 1 (expected work is a mean); scans and BSGS cover each key once.
+    s.progress = algo == Algo::Kangaroo ? s.workDone / expected : std::min(1.0, s.workDone / expected);
+    if (s.rate > 0 && isActive(s.state)) s.etaSeconds = std::max(0.0, expected - s.workDone) / s.rate;
   }
   return s;
 }

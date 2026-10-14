@@ -15,6 +15,16 @@ struct DeviceProps {
   uint32_t multiprocessors = 0;
 };
 
+// Layout constants compiled into kernels.cuh; cuda_device.cu checks the macros and cuda_backend.cpp checks
+// gpu_common.h against these.
+inline constexpr uint32_t kScanGroup = 1024;
+inline constexpr uint32_t kScanHitCapacity = 4096;
+inline constexpr uint32_t kKangaroosPerThread = 64;
+inline constexpr uint32_t kKangarooComponents = 13;
+inline constexpr uint32_t kKangarooJumps = 512;
+inline constexpr uint32_t kKangarooEscapeJumps = 64;
+inline constexpr uint32_t kKangarooCycleWindow = 64;
+
 enum class KernelId { Scan, Kangaroo };
 
 // Number of CUDA devices; 0 with *error set when the driver/runtime reports none or fails.
@@ -30,8 +40,8 @@ void copyToHost(int device, void* dst, const void* src, size_t bytes);
 
 // Run `threads` threads in blocks of `block` and wait for completion. Pointers are device buffers.
 void launchScan(int device, uint32_t threads, uint32_t block, const void* params, const void* offsets,
-                const void* gtable, const void* targets, void* hits, void* hitCount);
-void launchKangaroo(int device, uint32_t threads, uint32_t block, const void* params, void* state, const void* jumps,
-                    void* dps, void* dpCount);
+                const void* gtable, const void* targets, void* hits, void* counters);
+void launchKangaroo(int device, uint32_t threads, uint32_t block, const void* params, const void* stateIn,
+                    void* stateOut, const void* jumps, void* dps, void* counters);
 
 }  // namespace bsolver::cuda

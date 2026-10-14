@@ -8,6 +8,13 @@
  *   MULHI64(a, b)  high 64 bits of a * b       (mul_hi / mulhi / __umul64hi)
  *   U64, U32       unsigned integer types
  *   ATOMIC_INC(p)  atomically increments the U32 at GLOB pointer p, yields the old value
+ * and the layout constants generated from src/backend/gpu/gpu_common.h (gpu::kernelDefines(); CUDA: kernels.cuh):
+ *   GPU_GROUP        keys per scan group (even)
+ *   SCAN_HIT_CAP     scan hit buffer entries
+ *   KPT              kangaroos per kangaroo thread (<= 64: per-thread bit masks)
+ *   KANG_COMPONENTS  state words per kangaroo
+ *   KANG_JUMPS, KANG_ESC_JUMPS, KANG_WINDOW  kangaroo jump table sizes and cycle-check window (powers of two)
+ * Optional: FE_SQR_VIA_MUL makes fe_sqr(a) = fe_mul(a, a) (faster on Apple GPUs).
  *
  * Field arithmetic mirrors src/core/field.h/.cpp exactly (reduction by 0x1000003D1, libsecp256k1
  * inversion chain); the scan loop mirrors PointEnumerator (src/core/point_enum.h). Host-side layouts
@@ -16,10 +23,11 @@
 #ifndef BSOLVER_KERNEL_CORE_H
 #define BSOLVER_KERNEL_CORE_H
 
-#define GPU_GROUP 64
+#if !defined(GPU_GROUP) || !defined(SCAN_HIT_CAP) || !defined(KPT) || !defined(KANG_COMPONENTS) || \
+    !defined(KANG_JUMPS) || !defined(KANG_ESC_JUMPS) || !defined(KANG_WINDOW)
+#error "the backend prelude must define the kernel layout constants"
+#endif
 #define GPU_HALF (GPU_GROUP / 2)
-#define SCAN_HIT_CAP 4096
-#define KPT 64
 
 #define FE_C ((U64)0x1000003D1)
 
@@ -210,6 +218,9 @@ KFN fe_t fe_mul(fe_t a, fe_t b) {
   return fe_reduce512(t);
 }
 
+#ifdef FE_SQR_VIA_MUL
+KFN fe_t fe_sqr(fe_t a) { return fe_mul(a, a); }
+#else
 KFN fe_t fe_sqr(fe_t a) {
   /* Off-diagonal products once, doubled, plus the squares on the diagonal. */
   U64 t[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -248,6 +259,7 @@ KFN fe_t fe_sqr(fe_t a) {
   }
   return fe_reduce512(t);
 }
+#endif
 
 KFN fe_t fe_sqr_n(fe_t a, int n) {
   for (int i = 0; i < n; ++i) a = fe_sqr(a);
@@ -698,9 +710,9 @@ KFN int target_contains(GLOB const U32* targets, U32 count, PRIV const U32* h) {
 /* ---- scan ------------------------------------------------------------------------------------- */
 
 /* Hashes P per address mode (bit 0 compressed, bit 1 uncompressed) and records target hits as
-   {thread, iter, offset, uncompressed}. */
+   {thread, iter, offset, uncompressed}; counters[0] counts them. */
 KFN void scan_check(fe_t x, fe_t y, U32 mode, GLOB const U32* targets, U32 targetCount, U32 tid, U32 iter,
-                    int offset, GLOB U32* hits, GLOB U32* hitCount) {
+                    int offset, GLOB U32* hits, GLOB U32* counters) {
   U32 h[5];
   for (U32 unc = 0; unc < 2; ++unc) {
     if (!(mode & (1u << unc))) continue;
@@ -710,7 +722,7 @@ KFN void scan_check(fe_t x, fe_t y, U32 mode, GLOB const U32* targets, U32 targe
       hash160_compressed(x, y, h);
     }
     if (target_contains(targets, targetCount, h)) {
-      U32 slot = ATOMIC_INC(hitCount);
+      U32 slot = ATOMIC_INC(counters);
       if (slot < SCAN_HIT_CAP) {
         hits[4 * slot] = tid;
         hits[4 * slot + 1] = iter;
@@ -721,11 +733,14 @@ KFN void scan_check(fe_t x, fe_t y, U32 mode, GLOB const U32* targets, U32 targe
   }
 }
 
-/* Thread t scans `iters` groups of GPU_GROUP keys. params: [0..7] B = segStart*G (x, y), [8] iters | mode << 32,
-   [9] target count. offsets[8t..8t+7] = (t*S + GPU_HALF)*G with S = iters*GPU_GROUP. gtable[8(i-1)..] = i*G for
-   i = 1..GPU_HALF, then GPU_GROUP*G. Center C covers keys C-GPU_HALF..C+GPU_HALF-1. */
-KFN void scan_thread(U32 t, GLOB const U64* params, GLOB const U64* offsets, GLOB const U64* gtable,
-                     GLOB const U32* targets, GLOB U32* hits, GLOB U32* hitCount) {
+/* Dispatch thread `lid` scans as thread t = params[10] + lid (a launch may cover a slice of the T threads) the
+   `iters` groups of GPU_GROUP keys. params: [0..7] B = segStart*G (x, y), [8] iters | mode << 32, [9] target count,
+   [10] first thread. offsets[8t..8t+7] = (t*S + GPU_HALF)*G with S = iters*GPU_GROUP. gtable[8(i-1)..] = i*G for
+   i = 1..GPU_HALF, then GPU_GROUP*G. Center C covers keys C-GPU_HALF..C+GPU_HALF-1. counters: [0] hits, [1] threads
+   that ran to the end (a dropped launch leaves it short). */
+KFN void scan_thread(U32 lid, GLOB const U64* params, GLOB const U64* offsets, GLOB const U64* gtable,
+                     GLOB const U32* targets, GLOB U32* hits, GLOB U32* counters) {
+  U32 t = (U32)params[10] + lid;
   U32 iters = (U32)params[8];
   U32 mode = (U32)(params[8] >> 32);
   U32 targetCount = (U32)params[9];
@@ -773,68 +788,111 @@ KFN void scan_thread(U32 t, GLOB const U64* params, GLOB const U64* offsets, GLO
           pt_add(cx, cy, gx, gy, di, &nx, &ny);
           continue;
         }
-        scan_check(px, py, mode, targets, targetCount, t, it, offset, hits, hitCount);
+        scan_check(px, py, mode, targets, targetCount, t, it, offset, hits, counters);
       }
     }
     cx = nx;
     cy = ny;
   }
+  ATOMIC_INC(counters + 1);
 }
 
-/* ---- kangaroo --------------------------------------------------------------------------------- */
+/* ---- kangaroo (symmetric walk) ---------------------------------------------------------------- */
 
-/* Thread t of T walks kangaroos i = g*T + t (g < KPT) for `steps` jumps each.
-   params: [0] N = T*KPT, [1] steps, [2] dpBits, [3] DP capacity.
-   state: 12 words per kangaroo in component-major order, word c*N + i (c: x0..x3, y0..y3, dist0..dist3).
-   jumps: 12 words per jump j (x, y, dist). A jump is j = x.d[0] & 63: P += jumpPoint[j], dist += jumpDist[j].
-   dps: 9 words per entry {index, x[4], dist[4]}; index bit 63 set = kangaroo stuck on dx == 0 (needs a reset). */
-KFN void kangaroo_thread(U32 t, GLOB const U64* params, GLOB U64* state, GLOB const U64* jumps, GLOB U64* dps,
-                         GLOB U32* dpCount) {
+/* Row of the device jump buffer used from x.d[0]: look-ahead entry when flag is set, else main entry. */
+KFN U64 kang_jump_index(U64 x0, U64 flag) {
+  return flag ? KANG_JUMPS + (x0 & (KANG_ESC_JUMPS - 1)) : (x0 & (KANG_JUMPS - 1));
+}
+
+/* Thread t of T walks kangaroos i = g*T + t (g < KPT) for `steps` jumps each; one batch inversion per round.
+   params: [0] N = T*KPT, [1] steps, [2] dpBits, [3] DP capacity, [4] steps walked before this launch.
+   in / out: kangaroo state before / after the launch (separate buffers, so a dropped launch leaves `in` intact for a
+   retry). Word c*N + i for c = x0..x3, y0..y3, dist0..dist3 (signed two's complement), ref (x.d[0] snapshot for
+   fruitless-cycle detection); then T words at KANG_COMPONENTS*N: bit g of word t = look-ahead flag of kangaroo
+   g*T + t.
+   jumps: 12 words (x, y, dist) per entry: KANG_JUMPS main entries, then KANG_ESC_JUMPS look-ahead entries.
+   Step (bit-exact with kangarooStep() in engine/kangaroo_params.h): neg = y odd; (D, d) = flag ?
+   lookahead[x & (KANG_ESC_JUMPS-1)] : jumps[j = x & (KANG_JUMPS-1)]; P += neg ? -D : D; dist += neg ? -d : d;
+   flag = main && (x' & (KANG_JUMPS-1)) == j && parity(y') != neg.
+   Cycle detection: after each step x'.d[0] is compared with ref, which is refreshed to x'.d[0] whenever the global
+   step count (params[4] + s + 1) is a multiple of KANG_WINDOW, so every cycle of length <= KANG_WINDOW is seen.
+   dps: 9 words per entry {index, x[4], dist[4]}; index bit 63 = stuck on dx == 0 (P == +-D: the kangaroo stops for
+   the rest of the launch and needs a reset), bit 62 = looped (it keeps walking and needs a cycle escape). Each is
+   reported at most once per kangaroo and launch. counters: [0] dps entries, [1] threads that ran to the end. */
+KFN void kangaroo_thread(U32 t, GLOB const U64* params, GLOB const U64* in, GLOB U64* out, GLOB const U64* jumps,
+                         GLOB U64* dps, GLOB U32* counters) {
   U32 n = (U32)params[0];
   U32 steps = (U32)params[1];
   U32 dpBits = (U32)params[2];
   U32 dpCap = (U32)params[3];
+  U64 base = params[4];
   U32 T = n / KPT;
+  U64 flags = in[(U64)KANG_COMPONENTS * n + t];
+  U64 stuck = 0, looped = 0;
   fe_t px[KPT], py[KPT], dist[KPT], pre[KPT];
+  U64 ref[KPT];
   for (int g = 0; g < KPT; ++g) {
     U32 i = (U32)g * T + t;
     for (int l = 0; l < 4; ++l) {
-      px[g].d[l] = state[(U64)l * n + i];
-      py[g].d[l] = state[(U64)(4 + l) * n + i];
-      dist[g].d[l] = state[(U64)(8 + l) * n + i];
+      px[g].d[l] = in[(U64)l * n + i];
+      py[g].d[l] = in[(U64)(4 + l) * n + i];
+      dist[g].d[l] = in[(U64)(8 + l) * n + i];
     }
+    ref[g] = in[(U64)12 * n + i];
   }
   for (U32 s = 0; s < steps; ++s) {
     fe_t acc = fe_one();
     for (int g = 0; g < KPT; ++g) {
       pre[g] = acc;
-      fe_t dx = fe_sub(fe_load(jumps + 12 * (px[g].d[0] & 63)), px[g]);
+      if ((stuck >> g) & 1) continue;
+      U64 j = kang_jump_index(px[g].d[0], (flags >> g) & 1);
+      fe_t dx = fe_sub(fe_load(jumps + 12 * j), px[g]);
       if (!fe_is_zero(dx)) acc = fe_mul(acc, dx);
     }
     fe_t inv = fe_inv(acc);
+    int refresh = ((base + s + 1) & (KANG_WINDOW - 1)) == 0;
     for (int g = KPT - 1; g >= 0; --g) {
+      if ((stuck >> g) & 1) continue;
       U32 i = (U32)g * T + t;
-      GLOB const U64* jp = jumps + 12 * (px[g].d[0] & 63);
+      U64 bit = (U64)1 << g;
+      int useMain = !((flags >> g) & 1);
+      U64 j = kang_jump_index(px[g].d[0], !useMain);
+      GLOB const U64* jp = jumps + 12 * j;
       fe_t jx = fe_load(jp);
       fe_t dx = fe_sub(jx, px[g]);
       if (fe_is_zero(dx)) {
-        U32 slot = ATOMIC_INC(dpCount);
+        stuck |= bit;
+        U32 slot = ATOMIC_INC(counters);
         if (slot < dpCap) dps[9 * (U64)slot] = ((U64)1 << 63) | i;
         continue;
       }
       fe_t di = fe_mul(inv, pre[g]);
       inv = fe_mul(inv, dx);
-      pt_add(px[g], py[g], jx, fe_load(jp + 4), di, &px[g], &py[g]);
-      U64 c = 0;
+      U64 neg = py[g].d[0] & 1;
+      fe_t jy = fe_load(jp + 4);
+      if (neg) jy = fe_neg(jy);
+      pt_add(px[g], py[g], jx, jy, di, &px[g], &py[g]);
+      /* dist += neg ? -d : d, computed as dist + (d ^ mask) + neg. */
+      U64 mask = (U64)0 - neg;
+      U64 c = neg;
       for (int l = 0; l < 4; ++l) {
-        U64 j = jp[8 + l];
-        U64 v = dist[g].d[l] + j;
-        U64 c1 = v < j;
-        dist[g].d[l] = v + c;
-        c = c1 | (dist[g].d[l] < v);
+        U64 v = jp[8 + l] ^ mask;
+        U64 sum = dist[g].d[l] + v;
+        U64 c1 = sum < v;
+        dist[g].d[l] = sum + c;
+        c = c1 | (dist[g].d[l] < sum);
       }
+      U64 x0 = px[g].d[0];
+      U64 hit = useMain && (x0 & (KANG_JUMPS - 1)) == j && (py[g].d[0] & 1) != neg;
+      flags = (flags & ~bit) | (hit << g);
+      if (x0 == ref[g] && !(looped & bit)) {
+        looped |= bit;
+        U32 slot = ATOMIC_INC(counters);
+        if (slot < dpCap) dps[9 * (U64)slot] = ((U64)1 << 62) | i;
+      }
+      if (refresh) ref[g] = x0;
       if (dpBits == 0 || (px[g].d[3] >> (64 - dpBits)) == 0) {
-        U32 slot = ATOMIC_INC(dpCount);
+        U32 slot = ATOMIC_INC(counters);
         if (slot < dpCap) {
           GLOB U64* e = dps + 9 * (U64)slot;
           e[0] = i;
@@ -847,11 +905,14 @@ KFN void kangaroo_thread(U32 t, GLOB const U64* params, GLOB U64* state, GLOB co
   for (int g = 0; g < KPT; ++g) {
     U32 i = (U32)g * T + t;
     for (int l = 0; l < 4; ++l) {
-      state[(U64)l * n + i] = px[g].d[l];
-      state[(U64)(4 + l) * n + i] = py[g].d[l];
-      state[(U64)(8 + l) * n + i] = dist[g].d[l];
+      out[(U64)l * n + i] = px[g].d[l];
+      out[(U64)(4 + l) * n + i] = py[g].d[l];
+      out[(U64)(8 + l) * n + i] = dist[g].d[l];
     }
+    out[(U64)12 * n + i] = ref[g];
   }
+  out[(U64)KANG_COMPONENTS * n + t] = flags;
+  ATOMIC_INC(counters + 1);
 }
 
 #endif /* BSOLVER_KERNEL_CORE_H */

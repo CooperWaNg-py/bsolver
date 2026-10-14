@@ -9,6 +9,7 @@
 #include "core/address.h"
 #include "core/field.h"
 #include "core/gtable.h"
+#include "core/hash_batch.h"
 #include "core/hex.h"
 #include "core/point.h"
 #include "core/point_enum.h"
@@ -143,6 +144,57 @@ TEST_CASE("batchInverse skips zeros") {
       CHECK(v[i].isZero());
     } else {
       CHECK(feMul(orig[i], v[i]) == Fe::fromU64(1));
+    }
+  }
+}
+
+TEST_CASE("batched hash160 matches the scalar reference on every supported implementation") {
+  const auto& impls = supportedHashImpls();
+  REQUIRE(!impls.empty());
+  CHECK(impls.front() == HashImpl::Scalar);
+  CHECK(bestHashImpl() == impls.back());
+  for (HashImpl impl : impls) {
+    INFO("implementation " << hashImplName(impl));
+    const Hash160Batch& batch = hash160Batch(impl);
+    Rng rng(42);
+    for (int round = 0; round < 32; ++round) {
+      HashLaneWords x, y;
+      uint32_t parity[kHashLanes];
+      for (size_t l = 0; l < kHashLanes; ++l) {
+        for (int i = 0; i < 8; ++i) {
+          x[i][l] = static_cast<uint32_t>(rng.next());
+          y[i][l] = static_cast<uint32_t>(rng.next());
+        }
+        parity[l] = static_cast<uint32_t>(rng.next() & 1);
+      }
+      HashLaneDigests comp, uncomp;
+      batch.compressed(x, parity, comp);
+      batch.uncompressed(x, y, uncomp);
+      for (size_t l = 0; l < kHashLanes; ++l) {
+        uint8_t pub[65];
+        pub[0] = 0x04;
+        for (int i = 0; i < 8; ++i) {
+          for (int b = 0; b < 4; ++b) {
+            pub[1 + 4 * i + b] = static_cast<uint8_t>(x[i][l] >> (24 - 8 * b));
+            pub[33 + 4 * i + b] = static_cast<uint8_t>(y[i][l] >> (24 - 8 * b));
+          }
+        }
+        uint8_t expectU[20], expectC[20], gotU[20], gotC[20];
+        hash160_65(pub, expectU);
+        uint8_t pubC[33];
+        pubC[0] = static_cast<uint8_t>(2 + parity[l]);
+        std::memcpy(pubC + 1, pub + 1, 32);
+        hash160_33(pubC, expectC);
+        for (int i = 0; i < 5; ++i) {
+          for (int b = 0; b < 4; ++b) {
+            gotC[4 * i + b] = static_cast<uint8_t>(comp[i][l] >> (8 * b));
+            gotU[4 * i + b] = static_cast<uint8_t>(uncomp[i][l] >> (8 * b));
+          }
+        }
+        INFO("round " << round << " lane " << l);
+        CHECK(hexEncode(gotC, 20) == hexEncode(expectC, 20));
+        CHECK(hexEncode(gotU, 20) == hexEncode(expectU, 20));
+      }
     }
   }
 }

@@ -23,7 +23,7 @@ struct X128 {
 class KangarooTable {
  public:
   struct Entry {
-    U256 dist;
+    U256 dist;  // mod n
     bool wild = false;
   };
 
